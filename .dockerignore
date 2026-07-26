@@ -1,0 +1,10 @@
+# Keep the build context small and free of secrets.
+.build/
+.git/
+.github/
+certs/
+state/
+*.p8
+*.pem
+*.key
+.DS_Store

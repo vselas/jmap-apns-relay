@@ -1,0 +1,31 @@
+# Example deployment of jmap-apns-relay.
+#
+#   cp compose.example.yaml compose.yaml   # then edit the APNS_* values
+#   ./scripts/gen-dev-certs.sh             # or drop your own TLS cert in ./secrets
+#   docker compose up -d
+#
+# Put the TLS cert/key and the APNs .p8 in ./secrets (gitignored).
+services:
+  relay:
+    image: dvselas/jmap-apns-relay:latest
+    # To build from source instead of pulling, comment `image:` and use:
+    # build: .
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      PORT: "8443"
+      TLS_CERT: /secrets/tls.crt
+      TLS_KEY: /secrets/tls.key
+      STATE_PATH: /state/relay.json
+      # --- APNs (omit all four to run in dev/log mode) ---
+      APNS_KEY_PATH: /secrets/AuthKey.p8
+      APNS_KEY_ID: "XXXXXXXXXX"
+      APNS_TEAM_ID: "XXXXXXXXXX"
+      APNS_TOPIC: "com.example.app"
+      APNS_ENVIRONMENT: "sandbox"   # dev/TestFlight builds; omit for production
+      # APNS_ALERT_TITLE: "Mail"
+      # APNS_ALERT_BODY: "New mail"
+    volumes:
+      - ./secrets:/secrets:ro
+      - ./state:/state

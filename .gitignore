@@ -1,0 +1,8 @@
+.build/
+.DS_Store
+
+# Secrets and local runtime state — never commit
+*.p8
+certs/
+state/
+*.env
