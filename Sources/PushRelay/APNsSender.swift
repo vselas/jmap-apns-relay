@@ -54,10 +54,13 @@ public actor APNsSender: PushSender {
         self.privateKey = try P256.Signing.PrivateKey(pemRepresentation: pem)
     }
 
-    public func send(payload: String, to registration: DeviceRegistration) async {
-        // The PushVerification handshake is consumed by the app's setup poll,
-        // never delivered as a notification — only forward StateChanges.
-        guard Self.isStateChange(payload) else { return }
+    public func send(_ push: PendingPush, to registration: DeviceRegistration) async {
+        // A plaintext PushVerification is consumed by the app's setup poll and
+        // is not worth a notification. An *encrypted* payload cannot be told
+        // apart from a StateChange without the device's key — which is the
+        // point — so it is always forwarded, and the extension decides. The
+        // cost is one generic notification during setup; see the README.
+        guard push.isEncrypted || Self.isStateChange(push.text ?? "") else { return }
         guard let deviceToken = registration.apnsToken else {
             relayLog("[push] no APNs token for \(registration.deviceId); skipping")
             return
@@ -71,7 +74,7 @@ public actor APNsSender: PushSender {
             request.headers.add(name: "apns-push-type", value: "alert")
             request.headers.add(name: "apns-priority", value: "10")
             request.body = .bytes(ByteBuffer(bytes: Self.alertPayload(
-                stateChange: payload, title: configuration.alertTitle, body: configuration.alertBody)))
+                push, title: configuration.alertTitle, body: configuration.alertBody)))
             let response = try await httpClient.execute(request, timeout: .seconds(10))
             if response.status != .ok {
                 let body = try? await response.body.collect(upTo: 4 * 1024)
@@ -117,17 +120,31 @@ public actor APNsSender: PushSender {
         return (try? JSONDecoder().decode(Envelope.self, from: data))?.type == "StateChange"
     }
 
-    /// The APNs alert body. Generic today; the raw StateChange rides along so a
-    /// Notification Service Extension can enrich it after a targeted sync.
-    static func alertPayload(stateChange: String, title: String = "Mail", body: String = "New mail") -> Data {
+    /// The APNs alert body.
+    ///
+    /// The alert text is always generic — the relay has no business knowing a
+    /// sender or a subject, and with an encrypted payload it could not know
+    /// them anyway. `mutable-content` lets the app's notification service
+    /// extension replace the text once it has decrypted and synced.
+    ///
+    /// An encrypted payload rides along base64-encoded under
+    /// `sigill.encrypted`; a plaintext one keeps the old `stateChange` field
+    /// so an app built before encryption still works against this relay.
+    static func alertPayload(_ push: PendingPush, title: String = "Mail", body: String = "New mail") -> Data {
         let aps: [String: Any] = [
             "alert": ["title": title, "body": body],
             "sound": "default",
             "mutable-content": 1,
         ]
         var root: [String: Any] = ["aps": aps]
-        if let data = stateChange.data(using: .utf8),
-            let object = try? JSONSerialization.jsonObject(with: data) {
+        if push.isEncrypted {
+            // Base64 because an APNs payload is JSON and this is not text.
+            // The account is whichever one holds the key that opens it, which
+            // is unambiguous in a way the JMAP account id never was.
+            root["sigill"] = ["encrypted": push.body.base64EncodedString()]
+        } else if let text = push.text,
+            let object = try? JSONSerialization.jsonObject(with: Data(text.utf8))
+        {
             root["stateChange"] = object
         }
         return (try? JSONSerialization.data(withJSONObject: root))

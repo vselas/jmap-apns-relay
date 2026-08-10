@@ -7,15 +7,36 @@ func relayLog(_ message: String) {
     try? FileHandle.standardOutput.write(contentsOf: Data((message + "\n").utf8))
 }
 
-/// A push message queued for a device: either Stalwart's PushVerification
-/// or a StateChange, forwarded verbatim.
+/// A push message queued for a device, forwarded verbatim.
+///
+/// The body is bytes rather than a `String` on purpose. When a subscription
+/// carries RFC 8291 keys the server encrypts what it sends, and the result is
+/// binary: forcing it through `String(decoding:as:UTF8.self)` mangles it, and
+/// reading it with `readString` yields nil. Bytes are also the honest model —
+/// the relay's job is to carry this somewhere, not to understand it.
 public struct PendingPush: Sendable, Codable, Equatable {
     public var receivedAt: Date
-    public var payload: String
+    /// The request body exactly as it arrived. Base64 in JSON, since `Data`
+    /// is what `Codable` encodes it as.
+    public var body: Data
+    /// The body's `Content-Encoding`. `aes128gcm` means the payload is
+    /// encrypted to the device and unreadable here; nil means plain JSON.
+    public var contentEncoding: String?
 
-    public init(receivedAt: Date = .now, payload: String) {
+    public init(receivedAt: Date = .now, body: Data, contentEncoding: String? = nil) {
         self.receivedAt = receivedAt
-        self.payload = payload
+        self.body = body
+        self.contentEncoding = contentEncoding
+    }
+
+    /// True when the payload is encrypted to the device — the relay can route
+    /// it but never read it.
+    public var isEncrypted: Bool { contentEncoding?.lowercased() == "aes128gcm" }
+
+    /// The body as text, when it *is* text. Nil for an encrypted payload,
+    /// which keeps callers from accidentally treating ciphertext as JSON.
+    public var text: String? {
+        isEncrypted ? nil : String(data: body, encoding: .utf8)
     }
 }
 
@@ -37,7 +58,7 @@ public struct DeviceRegistration: Sendable, Codable, Equatable {
 /// speaks APNs (APNSwift + a .p8 key); the development implementation logs
 /// and relies on the poll endpoint.
 public protocol PushSender: Sendable {
-    func send(payload: String, to registration: DeviceRegistration) async
+    func send(_ push: PendingPush, to registration: DeviceRegistration) async
 }
 
 /// Dev-mode sender: the queue plus the `/v1/pending` poll endpoint stand in
@@ -45,8 +66,15 @@ public protocol PushSender: Sendable {
 public struct LogPushSender: PushSender {
     public init() {}
 
-    public func send(payload: String, to registration: DeviceRegistration) async {
-        relayLog("[push] would deliver to \(registration.deviceId) (apns: \(registration.apnsToken ?? "none")): \(payload.prefix(200))")
+    public func send(_ push: PendingPush, to registration: DeviceRegistration) async {
+        // Never log the body itself: for a plaintext payload that is the
+        // account id and what changed in it, which is exactly what the relay
+        // should not be keeping.
+        let shape = push.isEncrypted ? "encrypted \(push.body.count)B" : "plaintext \(push.body.count)B"
+        relayLog(
+            "[push] would deliver to \(registration.deviceId) "
+                + "(apns: \(registration.apnsToken == nil ? "none" : "set")): \(shape)"
+        )
     }
 }
 
@@ -83,9 +111,9 @@ public actor RelayStore {
         registrations[deviceId]
     }
 
-    public func enqueue(deviceId: String, payload: String) {
+    public func enqueue(deviceId: String, push: PendingPush) {
         var queue = pending[deviceId, default: []]
-        queue.append(PendingPush(payload: payload))
+        queue.append(push)
         if queue.count > maxQueue {
             queue.removeFirst(queue.count - maxQueue)
         }

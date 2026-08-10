@@ -64,6 +64,7 @@ All configuration is via environment variables.
 | `TLS_CERT`         |          | —                           | PEM cert chain; enables HTTPS (required for real JMAP push)    |
 | `TLS_KEY`          |          | —                           | PEM private key                                                |
 | `STATE_PATH`       |          | `/tmp/pushrelay-state.json` | Device registry + pending queue (JSON)                         |
+| `RELAY_AUTH_TOKEN` |          | —                           | Bearer token for `/v1/register` and `/v1/pending` — **set it** (see below) |
 | `APNS_KEY_PATH`    |    ✓\*   | —                           | Path to the APNs `.p8` auth key                                |
 | `APNS_KEY_ID`      |    ✓\*   | —                           | The key's 10-char Key ID                                       |
 | `APNS_TEAM_ID`     |    ✓\*   | —                           | Apple Developer Team ID                                        |
@@ -79,10 +80,47 @@ delivery; set none of them to run in dev/log mode.
 
 | Method | Path                    | Purpose                                             |
 |--------|-------------------------|-----------------------------------------------------|
-| `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional) |
-| `POST` | `/v1/push/:deviceId`    | The JMAP `PushSubscription` webhook target          |
-| `GET`  | `/v1/pending/:deviceId` | Dev poll — returns and clears the device's queue    |
+| `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional). Requires the bearer token. |
+| `POST` | `/v1/push/:deviceId`    | The JMAP `PushSubscription` webhook target. Unauthenticated — the server sends what it sends; the unguessable device id is the capability. |
+| `GET`  | `/v1/pending/:deviceId` | Dev poll — returns and clears the device's queue. Requires the bearer token. |
 | `GET`  | `/healthz`              | Liveness                                            |
+
+## Encrypted payloads
+
+When a JMAP `PushSubscription` carries RFC 8291 keys, the server encrypts what
+it sends and the relay cannot read it. That is the intended shape: the relay's
+job is to carry a message to a device, not to know what is in it.
+
+The relay handles both:
+
+* **Encrypted** (`Content-Encoding: aes128gcm`) — the body is forwarded verbatim,
+  base64-encoded, as `sigill.encrypted` in the APNs payload. The alert text stays
+  generic, and `mutable-content: 1` lets the app's notification service extension
+  replace it after decrypting. Routing needs nothing from the body: the device id
+  is already in the URL.
+* **Plaintext** — the old `stateChange` field is still sent, so a client built
+  before encryption keeps working.
+
+Two consequences worth knowing:
+
+* The body is handled as **bytes**, not text. An encrypted payload is binary and
+  reading it as a `String` yields nothing.
+* With encryption on, the relay cannot tell a `PushVerification` from a
+  `StateChange`, so it forwards both. Expect one generic notification during
+  subscription setup.
+
+## Authentication
+
+`RELAY_AUTH_TOKEN` protects `/v1/register` and `/v1/pending` with a bearer
+token, compared in constant time. Leave it unset and the relay still runs — but
+it warns at startup, because an open registry means anyone who can reach the
+relay can claim a device id, or re-point an existing one at their own APNs token
+and receive that device's notifications. Encryption stops them *reading*
+anything; only the token stops them redirecting it.
+
+`/v1/push/:deviceId` stays open deliberately: it is the URL handed to the JMAP
+server, which sends what it sends. Someone who guesses a device id can enqueue
+noise, which an encrypting client discards as undecryptable.
 
 ## How a client integrates
 
