@@ -18,12 +18,15 @@ services:
       TLS_CERT: /secrets/tls.crt
       TLS_KEY: /secrets/tls.key
       STATE_PATH: /state/relay.json
+      # Production fails startup unless auth and complete APNs credentials are
+      # valid. Use "development" explicitly for the log sender + poll endpoint.
+      RELAY_MODE: production
       # Shared bearer token for /v1/register and /v1/pending. Without it the
       # registry is open: anyone who can reach the relay can claim a device id,
       # or re-point an existing one at their own APNs token and take over its
-      # notifications. The relay warns at startup when this is unset.
+      # notifications. Production mode refuses to start when this is unset.
       RELAY_AUTH_TOKEN: "change-me"
-      # --- APNs (omit all four to run in dev/log mode) ---
+      # --- APNs (required in production; omit all four only in development) ---
       APNS_KEY_PATH: /secrets/AuthKey.p8
       APNS_KEY_ID: "XXXXXXXXXX"
       APNS_TEAM_ID: "XXXXXXXXXX"

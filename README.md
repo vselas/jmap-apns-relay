@@ -36,6 +36,8 @@ docker run -d --name jmap-apns-relay -p 8443:8443 \
   -e PORT=8443 \
   -e TLS_CERT=/secrets/tls.crt -e TLS_KEY=/secrets/tls.key \
   -e STATE_PATH=/state/relay.json \
+  -e RELAY_MODE=production \
+  -e RELAY_AUTH_TOKEN='replace-with-a-long-random-secret' \
   -e APNS_KEY_PATH=/secrets/AuthKey_ABCDE12345.p8 \
   -e APNS_KEY_ID=ABCDE12345 \
   -e APNS_TEAM_ID=UA5PQ9SVT8 \
@@ -47,8 +49,9 @@ docker run -d --name jmap-apns-relay -p 8443:8443 \
 JMAP push URLs must be HTTPS (RFC 8620 §7.2), so the relay serves TLS whenever
 `TLS_CERT`/`TLS_KEY` are set — in production put it behind a reverse proxy or
 give it a real cert; the JMAP server must be able to reach it and trust that
-cert. Without the `APNS_*` variables the relay runs in **dev mode**: it logs
-each event and serves a `/v1/pending` poll endpoint instead of calling Apple.
+cert. In `RELAY_MODE=development`, omitting the `APNS_*` variables selects the
+log/poll sender. Production mode requires APNs credentials and an auth token and
+fails startup rather than silently degrading to the log sender.
 
 See [`compose.example.yaml`](compose.example.yaml) for a Compose deployment, and
 [`scripts/gen-dev-certs.sh`](scripts/gen-dev-certs.sh) to mint a self-signed cert
@@ -64,8 +67,9 @@ All configuration is via environment variables.
 | `TLS_CERT`         |          | —                           | PEM cert chain; enables HTTPS (required for real JMAP push)    |
 | `TLS_KEY`          |          | —                           | PEM private key                                                |
 | `STATE_PATH`       |          | `/tmp/pushrelay-state.json` | Device registry + pending queue (JSON)                         |
-| `RELAY_AUTH_TOKEN` |          | —                           | Bearer token for `/v1/register` and `/v1/pending` — **set it** (see below) |
-| `APNS_KEY_PATH`    |    ✓\*   | —                           | Path to the APNs `.p8` auth key                                |
+| `RELAY_MODE`       |          | `development`               | `development` or fail-closed `production`                     |
+| `RELAY_AUTH_TOKEN` | ✓ prod   | —                           | Bearer token for register, unregister, and pending endpoints   |
+| `APNS_KEY_PATH`    | ✓ prod\* | —                           | Path to the APNs `.p8` auth key                                |
 | `APNS_KEY_ID`      |    ✓\*   | —                           | The key's 10-char Key ID                                       |
 | `APNS_TEAM_ID`     |    ✓\*   | —                           | Apple Developer Team ID                                        |
 | `APNS_TOPIC`       |    ✓\*   | —                           | The app's bundle id                                            |
@@ -73,17 +77,20 @@ All configuration is via environment variables.
 | `APNS_ALERT_TITLE` |          | `Mail`                      | Fallback alert title (a Notification Service Extension can enrich) |
 | `APNS_ALERT_BODY`  |          | `New mail`                  | Fallback alert body                                            |
 
-\* The four `APNS_*` key variables are required **together** to enable real
-delivery; set none of them to run in dev/log mode.
+\* The four APNs credential variables must be set together. Partial APNs
+configuration is rejected in every mode.
 
 ## HTTP API
 
 | Method | Path                    | Purpose                                             |
 |--------|-------------------------|-----------------------------------------------------|
 | `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional). Requires the bearer token. |
+| `DELETE` | `/v1/register/:deviceId` | Unregister a device and discard its pending queue. Requires the current bearer token. |
 | `POST` | `/v1/push/:deviceId`    | The JMAP `PushSubscription` webhook target. Unauthenticated — the server sends what it sends; the unguessable device id is the capability. |
 | `GET`  | `/v1/pending/:deviceId` | Dev poll — returns and clears the device's queue. Requires the bearer token. |
+| `GET`  | `/v1/capabilities`      | Public protocol, feature, and limit discovery                    |
 | `GET`  | `/healthz`              | Liveness                                            |
+| `GET`  | `/readyz`               | Readiness; fails after a state persistence error    |
 
 ## Encrypted payloads
 
@@ -99,7 +106,14 @@ The relay handles both:
   replace it after decrypting. Routing needs nothing from the body: the device id
   is already in the URL.
 * **Plaintext** — the old `stateChange` field is still sent, so a client built
-  before encryption keeps working.
+  before encryption keeps working. The payload additionally carries
+  `sigill.deviceId` and `sigill.protocolVersion` for newer clients.
+
+The final JSON sent to APNs is limited to 4096 bytes. Oversized payloads are
+rejected and diagnosed rather than relying on APNs to reject them. APNs invalid
+token responses clear only the stale token (the registration remains available
+for a later re-registration); transient and permanent failures are classified
+in logs.
 
 Two consequences worth knowing:
 
@@ -111,12 +125,12 @@ Two consequences worth knowing:
 
 ## Authentication
 
-`RELAY_AUTH_TOKEN` protects `/v1/register` and `/v1/pending` with a bearer
-token, compared in constant time. Leave it unset and the relay still runs — but
-it warns at startup, because an open registry means anyone who can reach the
-relay can claim a device id, or re-point an existing one at their own APNs token
-and receive that device's notifications. Encryption stops them *reading*
-anything; only the token stops them redirecting it.
+`RELAY_AUTH_TOKEN` protects register, unregister, and `/v1/pending` with a bearer
+token, compared in constant time. Development mode still runs without one but
+warns at startup; production mode refuses to start. An open registry means
+anyone who can reach the relay can claim a device id, or re-point an existing
+one at their own APNs token and receive that device's notifications. Encryption
+stops them *reading* anything; only the token stops them redirecting it.
 
 `/v1/push/:deviceId` stays open deliberately: it is the URL handed to the JMAP
 server, which sends what it sends. Someone who guesses a device id can enqueue
@@ -159,6 +173,7 @@ it as a secret.
 ```bash
 swift build
 swift test
+swift build -c release
 ```
 
 Requires Swift 6.2+. The Docker image is built from the [`Dockerfile`](Dockerfile)
@@ -166,12 +181,21 @@ at the repo root.
 
 ## Security
 
-- The relay stores only opaque device ids and APNs tokens — never message
-  content. `StateChange` payloads carry object *state strings*, not mail bodies.
+- The relay stores opaque device ids, APNs tokens, and its bounded pending push
+  queues. Plaintext `StateChange` payloads contain object state strings, not mail
+  bodies; encrypted payloads remain opaque bytes.
 - Serve it over TLS and keep the `.p8` out of the image and repo.
 - The `/v1/pending` poll endpoint is a development aid; it exposes queued
   payloads for a device id to anyone who knows that id — don't rely on it in
   production.
+
+## State format
+
+`STATE_PATH` is an atomically replaced, versioned JSON snapshot. Its parent
+directories are created at startup. Existing unversioned snapshots are read and
+migrated in place; malformed data, unsupported versions, and startup I/O errors
+fail startup rather than silently starting with an empty registry. Runtime write
+errors make `/readyz` return 503 and are returned by the mutating request.
 
 ## License
 

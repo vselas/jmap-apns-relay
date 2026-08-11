@@ -19,22 +19,54 @@ public struct APNsConfiguration: Sendable {
     /// Builds a configuration only when every required APNs variable is set;
     /// returns `nil` otherwise so the relay falls back to the dev log sender.
     public init?(environment: [String: String]) {
+        do {
+            guard let configuration = try Self.validated(environment: environment) else { return nil }
+            self = configuration
+        } catch {
+            return nil
+        }
+    }
+
+    static func validated(environment: [String: String]) throws -> APNsConfiguration? {
+        let names = ["APNS_KEY_PATH", "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_TOPIC"]
+        let present = names.filter { environment[$0]?.isEmpty == false }
+        guard !present.isEmpty else { return nil }
+        guard present.count == names.count else { throw ConfigurationError.incompleteCredentials }
         guard let keyPath = environment["APNS_KEY_PATH"],
             let keyId = environment["APNS_KEY_ID"],
             let teamId = environment["APNS_TEAM_ID"],
             let topic = environment["APNS_TOPIC"]
-        else { return nil }
+        else { throw ConfigurationError.incompleteCredentials }
+        let apnsEnvironment = environment["APNS_ENVIRONMENT"]?.lowercased() ?? "production"
+        guard apnsEnvironment == "production" || apnsEnvironment == "sandbox" else {
+            throw ConfigurationError.invalidEnvironment(apnsEnvironment)
+        }
+        return APNsConfiguration(
+            keyPath: keyPath,
+            keyId: keyId,
+            teamId: teamId,
+            topic: topic,
+            host: apnsEnvironment == "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com",
+            alertTitle: environment["APNS_ALERT_TITLE"] ?? "Mail",
+            alertBody: environment["APNS_ALERT_BODY"] ?? "New mail"
+        )
+    }
+
+    enum ConfigurationError: Error, Equatable {
+        case incompleteCredentials
+        case invalidEnvironment(String)
+    }
+
+    private init(keyPath: String, keyId: String, teamId: String, topic: String, host: String, alertTitle: String, alertBody: String) {
         self.keyPath = keyPath
         self.keyId = keyId
         self.teamId = teamId
         self.topic = topic
         // Must match the installed build's aps-environment: development and
         // TestFlight sandbox builds require the sandbox host.
-        self.host = environment["APNS_ENVIRONMENT"]?.lowercased() == "sandbox"
-            ? "api.sandbox.push.apple.com"
-            : "api.push.apple.com"
-        self.alertTitle = environment["APNS_ALERT_TITLE"] ?? "Mail"
-        self.alertBody = environment["APNS_ALERT_BODY"] ?? "New mail"
+        self.host = host
+        self.alertTitle = alertTitle
+        self.alertBody = alertBody
     }
 }
 
@@ -42,6 +74,7 @@ public struct APNsConfiguration: Sendable {
 /// the provider JWT (Apple wants it reused 20–60 min), and sends each Stalwart
 /// `StateChange` as an alert push over HTTP/2.
 public actor APNsSender: PushSender {
+    public static let maximumPayloadBytes = 4_096
     private let configuration: APNsConfiguration
     private let httpClient: HTTPClient
     private let privateKey: P256.Signing.PrivateKey
@@ -54,16 +87,18 @@ public actor APNsSender: PushSender {
         self.privateKey = try P256.Signing.PrivateKey(pemRepresentation: pem)
     }
 
-    public func send(_ push: PendingPush, to registration: DeviceRegistration) async {
+    public func send(_ push: PendingPush, to registration: DeviceRegistration) async -> DeliveryOutcome {
         // A plaintext PushVerification is consumed by the app's setup poll and
         // is not worth a notification. An *encrypted* payload cannot be told
         // apart from a StateChange without the device's key — which is the
         // point — so it is always forwarded, and the extension decides. The
         // cost is one generic notification during setup; see the README.
-        guard push.isEncrypted || Self.isStateChange(push.text ?? "") else { return }
+        guard push.isEncrypted || Self.isStateChange(push.text ?? "") else {
+            return .skipped(reason: "not a StateChange")
+        }
         guard let deviceToken = registration.apnsToken else {
             relayLog("[push] no APNs token for \(registration.deviceId); skipping")
-            return
+            return .skipped(reason: "no APNs token")
         }
         do {
             let jwt = try bearerToken()
@@ -73,18 +108,27 @@ public actor APNsSender: PushSender {
             request.headers.add(name: "apns-topic", value: configuration.topic)
             request.headers.add(name: "apns-push-type", value: "alert")
             request.headers.add(name: "apns-priority", value: "10")
-            request.body = .bytes(ByteBuffer(bytes: Self.alertPayload(
-                push, title: configuration.alertTitle, body: configuration.alertBody)))
+            let payload = try Self.alertPayload(
+                push,
+                deviceId: registration.deviceId,
+                title: configuration.alertTitle,
+                body: configuration.alertBody
+            )
+            request.body = .bytes(ByteBuffer(bytes: payload))
             let response = try await httpClient.execute(request, timeout: .seconds(10))
-            if response.status != .ok {
-                let body = try? await response.body.collect(upTo: 4 * 1024)
-                let text = body.map { String(buffer: $0) } ?? ""
-                // 410 = token no longer valid (app removed); a later pass could
-                // prune it from the registry.
-                relayLog("[push] APNs \(response.status.code) for \(registration.deviceId): \(text)")
-            }
+            guard response.status != .ok else { return .delivered }
+            let body = try? await response.body.collect(upTo: 4 * 1024)
+            let text = body.map { String(buffer: $0) } ?? ""
+            let reason = Self.responseReason(text) ?? "HTTP \(response.status.code)"
+            let outcome = Self.classify(status: Int(response.status.code), reason: reason)
+            relayLog("[push] APNs \(response.status.code) for \(registration.deviceId): \(reason)")
+            return outcome
+        } catch let error as PayloadError {
+            relayLog("[push] APNs payload rejected for \(registration.deviceId): \(error)")
+            return .permanentFailure(reason: String(describing: error))
         } catch {
             relayLog("[push] APNs send failed for \(registration.deviceId): \(error)")
+            return .transientFailure(reason: String(describing: error))
         }
     }
 
@@ -130,7 +174,16 @@ public actor APNsSender: PushSender {
     /// An encrypted payload rides along base64-encoded under
     /// `sigill.encrypted`; a plaintext one keeps the old `stateChange` field
     /// so an app built before encryption still works against this relay.
-    static func alertPayload(_ push: PendingPush, title: String = "Mail", body: String = "New mail") -> Data {
+    enum PayloadError: Error, Equatable {
+        case exceedsMaximum(actual: Int, maximum: Int)
+    }
+
+    static func alertPayload(
+        _ push: PendingPush,
+        deviceId: String = "",
+        title: String = "Mail",
+        body: String = "New mail"
+    ) throws -> Data {
         let aps: [String: Any] = [
             "alert": ["title": title, "body": body],
             "sound": "default",
@@ -146,9 +199,32 @@ public actor APNsSender: PushSender {
             let object = try? JSONSerialization.jsonObject(with: Data(text.utf8))
         {
             root["stateChange"] = object
+            root["sigill"] = ["deviceId": deviceId, "protocolVersion": 1]
         }
-        return (try? JSONSerialization.data(withJSONObject: root))
+        let data = (try? JSONSerialization.data(withJSONObject: root))
             ?? Data(#"{"aps":{"alert":"New mail"}}"#.utf8)
+        guard data.count <= maximumPayloadBytes else {
+            throw PayloadError.exceedsMaximum(actual: data.count, maximum: maximumPayloadBytes)
+        }
+        return data
+    }
+
+    static func responseReason(_ body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return object["reason"] as? String
+    }
+
+    static func classify(status: Int, reason: String) -> DeliveryOutcome {
+        let invalidReasons = ["BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"]
+        if status == 410 || invalidReasons.contains(reason) {
+            return .invalidToken(reason: reason)
+        }
+        if status == 429 || status >= 500 {
+            return .transientFailure(reason: reason)
+        }
+        return .permanentFailure(reason: reason)
     }
 
     static func base64URL(_ data: Data) -> String {

@@ -58,7 +58,15 @@ public struct DeviceRegistration: Sendable, Codable, Equatable {
 /// speaks APNs (APNSwift + a .p8 key); the development implementation logs
 /// and relies on the poll endpoint.
 public protocol PushSender: Sendable {
-    func send(_ push: PendingPush, to registration: DeviceRegistration) async
+    func send(_ push: PendingPush, to registration: DeviceRegistration) async -> DeliveryOutcome
+}
+
+public enum DeliveryOutcome: Sendable, Equatable {
+    case delivered
+    case skipped(reason: String)
+    case invalidToken(reason: String)
+    case transientFailure(reason: String)
+    case permanentFailure(reason: String)
 }
 
 /// Dev-mode sender: the queue plus the `/v1/pending` poll endpoint stand in
@@ -66,7 +74,7 @@ public protocol PushSender: Sendable {
 public struct LogPushSender: PushSender {
     public init() {}
 
-    public func send(_ push: PendingPush, to registration: DeviceRegistration) async {
+    public func send(_ push: PendingPush, to registration: DeviceRegistration) async -> DeliveryOutcome {
         // Never log the body itself: for a plaintext payload that is the
         // account id and what changed in it, which is exactly what the relay
         // should not be keeping.
@@ -75,6 +83,7 @@ public struct LogPushSender: PushSender {
             "[push] would deliver to \(registration.deviceId) "
                 + "(apns: \(registration.apnsToken == nil ? "none" : "set")): \(shape)"
         )
+        return .skipped(reason: "development log sender")
     }
 }
 
@@ -86,54 +95,137 @@ public actor RelayStore {
     private let persistenceURL: URL?
     private let maxQueue = 50
 
-    public init(persistenceURL: URL?) {
+    private var persistenceError: String?
+
+    public init(persistenceURL: URL?) throws {
         self.persistenceURL = persistenceURL
-        if let persistenceURL,
-            let data = try? Data(contentsOf: persistenceURL),
-            let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
-        {
+        guard let persistenceURL else { return }
+        let parent = persistenceURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        guard FileManager.default.fileExists(atPath: persistenceURL.path) else { return }
+        let data = try Data(contentsOf: persistenceURL)
+        let decoder = JSONDecoder()
+        if let snapshot = try? decoder.decode(Snapshot.self, from: data) {
+            guard snapshot.version == Snapshot.currentVersion else {
+                throw StoreError.unsupportedSnapshotVersion(snapshot.version)
+            }
             registrations = snapshot.registrations
             pending = snapshot.pending
+        } else {
+            let legacy = try decoder.decode(LegacySnapshot.self, from: data)
+            registrations = legacy.registrations
+            pending = legacy.pending
+            let migrated = Snapshot(
+                version: Snapshot.currentVersion,
+                registrations: registrations,
+                pending: pending
+            )
+            try JSONEncoder().encode(migrated).write(to: persistenceURL, options: .atomic)
         }
     }
 
     private struct Snapshot: Codable {
+        static let currentVersion = 1
+        var version: Int
         var registrations: [String: DeviceRegistration]
         var pending: [String: [PendingPush]]
     }
 
-    public func register(_ registration: DeviceRegistration) {
+    private struct LegacySnapshot: Codable {
+        var registrations: [String: DeviceRegistration]
+        var pending: [String: [PendingPush]]
+    }
+
+    public enum StoreError: Error, Equatable {
+        case unsupportedSnapshotVersion(Int)
+    }
+
+    public func register(_ registration: DeviceRegistration) throws {
+        let previous = registrations[registration.deviceId]
         registrations[registration.deviceId] = registration
-        persist()
+        do {
+            try persist()
+        } catch {
+            registrations[registration.deviceId] = previous
+            throw error
+        }
     }
 
     public func registration(deviceId: String) -> DeviceRegistration? {
         registrations[deviceId]
     }
 
-    public func enqueue(deviceId: String, push: PendingPush) {
+    public func enqueue(deviceId: String, push: PendingPush) throws {
+        let previous = pending[deviceId]
         var queue = pending[deviceId, default: []]
         queue.append(push)
         if queue.count > maxQueue {
             queue.removeFirst(queue.count - maxQueue)
         }
         pending[deviceId] = queue
-        persist()
+        do {
+            try persist()
+        } catch {
+            pending[deviceId] = previous
+            throw error
+        }
     }
 
     /// Returns and clears the device's queue.
-    public func drain(deviceId: String) -> [PendingPush] {
+    public func drain(deviceId: String) throws -> [PendingPush] {
         let queue = pending[deviceId] ?? []
         pending[deviceId] = []
-        persist()
+        do {
+            try persist()
+        } catch {
+            pending[deviceId] = queue
+            throw error
+        }
         return queue
     }
 
-    private func persist() {
+    public func unregister(deviceId: String) throws -> Bool {
+        guard let registration = registrations.removeValue(forKey: deviceId) else { return false }
+        let queued = pending.removeValue(forKey: deviceId)
+        do {
+            try persist()
+            return true
+        } catch {
+            registrations[deviceId] = registration
+            pending[deviceId] = queued
+            throw error
+        }
+    }
+
+    public func invalidateAPNsToken(deviceId: String, token: String) throws {
+        guard var registration = registrations[deviceId], registration.apnsToken == token else { return }
+        let previous = registration
+        registration.apnsToken = nil
+        registrations[deviceId] = registration
+        do {
+            try persist()
+        } catch {
+            registrations[deviceId] = previous
+            throw error
+        }
+    }
+
+    public func isReady() -> Bool { persistenceError == nil }
+
+    private func persist() throws {
         guard let persistenceURL else { return }
-        let snapshot = Snapshot(registrations: registrations, pending: pending)
-        if let data = try? JSONEncoder().encode(snapshot) {
-            try? data.write(to: persistenceURL, options: .atomic)
+        let snapshot = Snapshot(
+            version: Snapshot.currentVersion,
+            registrations: registrations,
+            pending: pending
+        )
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try data.write(to: persistenceURL, options: .atomic)
+            persistenceError = nil
+        } catch {
+            persistenceError = String(describing: error)
+            throw error
         }
     }
 }

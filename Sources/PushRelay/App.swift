@@ -10,6 +10,37 @@ struct RegisterBody: Decodable {
     var apnsToken: String?
 }
 
+enum RelayMode: String {
+    case development
+    case production
+}
+
+struct RuntimeConfiguration {
+    var mode: RelayMode
+    var authToken: String?
+    var apns: APNsConfiguration?
+
+    init(environment: [String: String]) throws {
+        let modeValue = environment["RELAY_MODE"]?.lowercased() ?? "development"
+        guard let mode = RelayMode(rawValue: modeValue) else {
+            throw ConfigurationError.invalidMode(modeValue)
+        }
+        self.mode = mode
+        authToken = environment["RELAY_AUTH_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
+        apns = try APNsConfiguration.validated(environment: environment)
+        if mode == .production {
+            guard authToken != nil else { throw ConfigurationError.productionRequiresAuthToken }
+            guard apns != nil else { throw ConfigurationError.productionRequiresAPNs }
+        }
+    }
+
+    enum ConfigurationError: Error, Equatable {
+        case invalidMode(String)
+        case productionRequiresAuthToken
+        case productionRequiresAPNs
+    }
+}
+
 /// Builds the relay router.
 ///
 /// Endpoints:
@@ -17,6 +48,7 @@ struct RegisterBody: Decodable {
 /// - `POST /v1/push/:deviceId`      Stalwart's PushSubscription webhook target
 /// - `GET  /v1/pending/:deviceId`   dev-mode poll (returns and clears queue)
 /// - `GET  /healthz`                liveness
+/// - `GET  /readyz`                 persistence readiness
 /// Whether a request carries the configured bearer token.
 ///
 /// Constant-time comparison: a token checked with `==` leaks its prefix to
@@ -45,6 +77,28 @@ public func buildRouter(
         "ok"
     }
 
+    router.get("readyz") { _, _ -> Response in
+        guard await store.isReady() else {
+            return Response(status: .serviceUnavailable)
+        }
+        return Response(status: .ok, body: .init(byteBuffer: ByteBuffer(string: "ready")))
+    }
+
+    router.get("v1/capabilities") { _, _ -> Response in
+        let capabilities: [String: Any] = [
+            "protocol": "jmap-apns-relay",
+            "protocolVersion": 1,
+            "features": ["encryptedForwarding", "plaintextMetadata", "pendingPoll", "unregister"],
+            "limits": ["maxWebhookBytes": 64 * 1024, "maxAPNsPayloadBytes": APNsSender.maximumPayloadBytes, "maxPendingPerDevice": 50],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: capabilities)
+        return Response(
+            status: .ok,
+            headers: [.contentType: "application/json"],
+            body: .init(byteBuffer: ByteBuffer(data: data))
+        )
+    }
+
     router.post("v1/register") { request, context -> Response in
         // Without this anyone who can reach the relay can claim any device id,
         // or re-point an existing one at their own APNs token and take over
@@ -57,7 +111,18 @@ public func buildRouter(
         guard !body.deviceId.isEmpty, body.deviceId.count <= 128 else {
             throw HTTPError(.badRequest)
         }
-        await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken))
+        try await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken))
+        return Response(status: .noContent)
+    }
+
+    router.delete("v1/register/:deviceId") { request, context -> Response in
+        guard isAuthorized(request, token: authToken) else {
+            throw HTTPError(.unauthorized)
+        }
+        let deviceId = try context.parameters.require("deviceId")
+        guard try await store.unregister(deviceId: deviceId) else {
+            throw HTTPError(.notFound)
+        }
         return Response(status: .noContent)
     }
 
@@ -79,8 +144,16 @@ public func buildRouter(
             body: body,
             contentEncoding: request.headers[.contentEncoding]
         )
-        await store.enqueue(deviceId: deviceId, push: push)
-        await sender.send(push, to: registration)
+        try await store.enqueue(deviceId: deviceId, push: push)
+        let outcome = await sender.send(push, to: registration)
+        if case .invalidToken(let reason) = outcome, let token = registration.apnsToken {
+            try await store.invalidateAPNsToken(deviceId: deviceId, token: token)
+            relayLog("[push] removed invalid APNs token for \(deviceId): \(reason)")
+        } else if case .permanentFailure(let reason) = outcome {
+            relayLog("[push] permanent delivery failure for \(deviceId): \(reason)")
+        } else if case .transientFailure(let reason) = outcome {
+            relayLog("[push] transient delivery failure for \(deviceId): \(reason)")
+        }
         // 200 tells Stalwart the push URL is alive.
         return Response(status: .ok)
     }
@@ -96,7 +169,7 @@ public func buildRouter(
         guard await store.registration(deviceId: deviceId) != nil else {
             throw HTTPError(.notFound)
         }
-        let drained = await store.drain(deviceId: deviceId)
+        let drained = try await store.drain(deviceId: deviceId)
         let data = try JSONEncoder().encode(drained)
         return Response(
             status: .ok,
@@ -112,22 +185,24 @@ public func buildRouter(
 struct PushRelayMain {
     static func main() async throws {
         let environment = ProcessInfo.processInfo.environment
+        let runtime = try RuntimeConfiguration(environment: environment)
         let port = environment["PORT"].flatMap(Int.init) ?? 8090
         let statePath = environment["STATE_PATH"] ?? "/tmp/pushrelay-state.json"
-        let store = RelayStore(persistenceURL: URL(filePath: statePath))
+        let store = try RelayStore(persistenceURL: URL(filePath: statePath))
 
         // Real APNs when a .p8 key is provisioned (APNS_KEY_PATH / APNS_KEY_ID
         // / APNS_TEAM_ID / APNS_TOPIC); otherwise the dev log + poll sender.
         let sender: any PushSender
-        if let apnsConfig = APNsConfiguration(environment: environment) {
+        if let apnsConfig = runtime.apns {
             let client = HTTPClient(eventLoopGroupProvider: .singleton)
             do {
                 sender = try APNsSender(configuration: apnsConfig, httpClient: client)
                 relayLog("[push] APNs sender active (topic \(apnsConfig.topic), host \(apnsConfig.host))")
             } catch {
                 try? await client.shutdown()
+                if runtime.mode == .production { throw error }
                 sender = LogPushSender()
-                relayLog("[push] APNs key load failed (\(error)); using log sender")
+                relayLog("[push] APNs key load failed (\(error)); using development log sender")
             }
         } else {
             sender = LogPushSender()
@@ -138,7 +213,7 @@ struct PushRelayMain {
         // is open — an unauthenticated registry is a notification hijack
         // waiting to happen, and silence would let that pass for a working
         // setup.
-        let authToken = environment["RELAY_AUTH_TOKEN"].flatMap { $0.isEmpty ? nil : $0 }
+        let authToken = runtime.authToken
         if authToken == nil {
             relayLog(
                 "[push] WARNING: RELAY_AUTH_TOKEN is not set — /v1/register accepts any device id, "
