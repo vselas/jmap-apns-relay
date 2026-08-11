@@ -43,7 +43,7 @@ docker run -d --name jmap-apns-relay -p 8443:8443 \
   -e APNS_TEAM_ID=UA5PQ9SVT8 \
   -e APNS_TOPIC=com.example.app \
   -e APNS_ENVIRONMENT=sandbox \
-  dvselas/jmap-apns-relay:0.2.0
+  dvselas/jmap-apns-relay:0.3.0
 ```
 
 JMAP push URLs must be HTTPS (RFC 8620 §7.2), so the relay serves TLS whenever
@@ -193,7 +193,7 @@ scripts/check-protocol-fixture.sh --self
 ```
 
 Requires Swift 6.2+. The Docker image is built from the [`Dockerfile`](Dockerfile)
-at the repo root. The example Compose file pins release `0.2.0`; use `:edge`
+at the repo root. The example Compose file pins release `0.3.0`; use `:edge`
 deliberately when testing unreleased `main` behavior.
 
 ## Security
