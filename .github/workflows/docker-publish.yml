@@ -1,7 +1,7 @@
 name: docker-publish
 
 # Publishes multi-arch images to Docker Hub:
-#   - push to main            -> :edge (and :latest via {{is_default_branch}})
+#   - push to main            -> :edge
 #   - push a tag vX.Y.Z       -> :X.Y.Z, :X.Y, :latest
 #
 # Requires two repository secrets:

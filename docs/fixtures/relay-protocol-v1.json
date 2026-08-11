@@ -1,0 +1,17 @@
+{
+  "capabilities": {
+    "protocol": "jmap-apns-relay",
+    "protocolVersion": 1,
+    "features": ["encryptedForwarding", "plaintextMetadata", "pendingPoll", "unregister"],
+    "limits": {"maxWebhookBytes": 65536, "maxAPNsPayloadBytes": 4096, "maxPendingPerDevice": 50}
+  },
+  "plaintextAPNs": {
+    "aps": {"alert": {"title": "Mail", "body": "New mail"}, "sound": "default", "mutable-content": 1},
+    "sigill": {"deviceId": "fixture-device", "protocolVersion": 1},
+    "stateChange": {"@type": "StateChange", "changed": {"c": {"Email": "s1"}}}
+  },
+  "encryptedAPNs": {
+    "aps": {"alert": {"title": "Mail", "body": "New mail"}, "sound": "default", "mutable-content": 1},
+    "sigill": {"encrypted": "AP8QQQQ="}
+  }
+}

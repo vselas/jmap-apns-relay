@@ -7,7 +7,7 @@
 # Put the TLS cert/key and the APNs .p8 in ./secrets (gitignored).
 services:
   relay:
-    image: dvselas/jmap-apns-relay:latest
+    image: dvselas/jmap-apns-relay:0.2.0
     # To build from source instead of pulling, comment `image:` and use:
     # build: .
     restart: unless-stopped

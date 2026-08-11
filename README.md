@@ -43,7 +43,7 @@ docker run -d --name jmap-apns-relay -p 8443:8443 \
   -e APNS_TEAM_ID=UA5PQ9SVT8 \
   -e APNS_TOPIC=com.example.app \
   -e APNS_ENVIRONMENT=sandbox \
-  dvselas/jmap-apns-relay:latest
+  dvselas/jmap-apns-relay:0.2.0
 ```
 
 JMAP push URLs must be HTTPS (RFC 8620 §7.2), so the relay serves TLS whenever
@@ -56,6 +56,10 @@ fails startup rather than silently degrading to the log sender.
 See [`compose.example.yaml`](compose.example.yaml) for a Compose deployment, and
 [`scripts/gen-dev-certs.sh`](scripts/gen-dev-certs.sh) to mint a self-signed cert
 for local testing.
+
+Sigill can build this checkout through its optional Compose override by setting
+`JMAP_APNS_RELAY_PATH` to this repository. No absolute checkout path needs to be
+committed.
 
 ## Configuration
 
@@ -149,11 +153,22 @@ noise, which an encrypting client discards as undecryptable.
 4. From then on the server POSTs a `StateChange` on every change; the relay
    delivers it to the device as an alert push.
 
-Only `StateChange` payloads are delivered to APNs; the `PushVerification`
-handshake is never turned into a user-visible notification. The alert carries
-the raw `StateChange` (with `mutable-content: 1`) so a
+Plaintext `PushVerification` payloads stay in the pending queue and are not sent
+to APNs. An encrypted verification is indistinguishable from an encrypted
+`StateChange`, so it is forwarded and can produce one generic setup alert; the
+device must decrypt and discard it. State changes use an alert push with
+`mutable-content: 1`, allowing a
 [Notification Service Extension](https://developer.apple.com/documentation/usernotifications/unnotificationserviceextension)
-can run a targeted sync and rewrite the alert with real sender/subject.
+to decrypt (when needed), run a targeted sync, and replace the generic text.
+
+Clients can probe `GET /v1/capabilities`. Protocol version 1 advertises
+`encryptedForwarding`, `plaintextMetadata`, `pendingPoll`, and `unregister`, plus
+the webhook, APNs-payload, and pending-queue limits. Older relays may not expose
+this endpoint, so clients should treat a 404/405 as an unknown legacy relay.
+The machine-readable contract is
+[`docs/fixtures/relay-protocol-v1.json`](docs/fixtures/relay-protocol-v1.json).
+`scripts/check-protocol-fixture.sh` validates it; set `SIGILL_PATH` to a Sigill
+checkout to additionally require both repositories' copies to match.
 
 ## APNs setup
 
@@ -174,10 +189,12 @@ it as a secret.
 swift build
 swift test
 swift build -c release
+scripts/check-protocol-fixture.sh --self
 ```
 
 Requires Swift 6.2+. The Docker image is built from the [`Dockerfile`](Dockerfile)
-at the repo root.
+at the repo root. The example Compose file pins release `0.2.0`; use `:edge`
+deliberately when testing unreleased `main` behavior.
 
 ## Security
 
@@ -185,9 +202,9 @@ at the repo root.
   queues. Plaintext `StateChange` payloads contain object state strings, not mail
   bodies; encrypted payloads remain opaque bytes.
 - Serve it over TLS and keep the `.p8` out of the image and repo.
-- The `/v1/pending` poll endpoint is a development aid; it exposes queued
-  payloads for a device id to anyone who knows that id — don't rely on it in
-  production.
+- The `/v1/pending` poll endpoint is a development aid. It exposes and drains a
+  device's queued payloads to callers holding the shared bearer token; production
+  deployments should not treat it as a general delivery API.
 
 ## State format
 

@@ -20,3 +20,5 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+      - name: Protocol fixture
+        run: scripts/check-protocol-fixture.sh --self
