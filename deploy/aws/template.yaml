@@ -33,10 +33,12 @@ Parameters:
   ReservedConcurrency:
     Type: Number
     Default: 20
-    MinValue: 1
+    MinValue: 0
     Description: >
       Hard ceiling on simultaneous instances. The webhook is unauthenticated by
-      design, so this bounds what a flood of junk requests can cost.
+      design, so this bounds what a flood of junk requests can cost. 0 means
+      no reservation: needed on a new account, whose whole Lambda quota is 10
+      and may not be reserved; the account quota is then the ceiling.
   AppStoreProductIds:
     Type: String
     Default: ""
@@ -61,6 +63,9 @@ Parameters:
     Type: Number
     Default: 14
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  ReserveConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
 
 Resources:
   Table:
@@ -145,7 +150,7 @@ Resources:
       Handler: bootstrap
       MemorySize: 256
       Timeout: 15
-      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      ReservedConcurrentExecutions: !If [ReserveConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
       Role: !GetAtt Role.Arn
       Code:
         S3Bucket: !Ref CodeBucket

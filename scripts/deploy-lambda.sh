@@ -30,6 +30,14 @@ REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
 : "${APNS_KEY_ID:?set APNS_KEY_ID}" "${APNS_TEAM_ID:?set APNS_TEAM_ID}" "${APNS_TOPIC:?set APNS_TOPIC}"
 APNS_ENVIRONMENT=${APNS_ENVIRONMENT:-production}
 RESERVED_CONCURRENCY=${RESERVED_CONCURRENCY:-20}
+# A new account's whole Lambda quota is 10, all of it unreservable. Reserving
+# anything would fail the stack, so fall back to none and say so.
+account_quota=$(aws lambda get-account-settings --region "$REGION" --query AccountLimit.ConcurrentExecutions --output text)
+if (( RESERVED_CONCURRENCY > 0 && account_quota - RESERVED_CONCURRENCY < 10 )); then
+  echo "Account Lambda quota is $account_quota; deploying without reserved concurrency (the quota is the ceiling)."
+  echo "Request more: aws service-quotas request-service-quota-increase --service-code lambda --quota-code L-B99A9384 --desired-value 1000"
+  RESERVED_CONCURRENCY=0
+fi
 ZIP="$ROOT/.build/lambda/relay-lambda.zip"
 [[ -f "$ZIP" ]] || { echo "Build first: scripts/build-lambda.sh" >&2; exit 2; }
 
@@ -82,7 +90,13 @@ fi
 KEY="builds/$(shasum -a 256 "$ZIP" | cut -c1-16).zip"
 aws s3 cp --region "$REGION" --only-show-errors "$ZIP" "s3://$BUCKET/$KEY"
 
-# 3. The stack.
+# 3. The stack. A first create that failed leaves ROLLBACK_COMPLETE, which can
+# only be deleted, not updated.
+if [[ "$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)" == ROLLBACK_COMPLETE ]]; then
+  echo "Removing $STACK left in ROLLBACK_COMPLETE by a failed first create"
+  aws cloudformation delete-stack --region "$REGION" --stack-name "$STACK"
+  aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$STACK"
+fi
 aws cloudformation deploy --region "$REGION" --stack-name "$STACK" \
   --template-file "$ROOT/deploy/aws/template.yaml" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
