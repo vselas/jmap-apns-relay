@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   jmap-apns-relay as an AWS Lambda behind a Function URL: one ARM64 function,
   one on-demand DynamoDB table, two SecureString parameters (created outside
-  this stack, so no secret ever passes through CloudFormation).
+  this stack, so no secret ever passes through CloudFormation), and optionally
+  a CloudFront distribution that serves it on a domain of your own.
 
 Parameters:
   Stage:
@@ -59,6 +60,22 @@ Parameters:
     Type: Number
     Default: 10
     MinValue: 1
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      The relay's own hostname (e.g. push.example.com), served through
+      CloudFront. Empty means the bare Function URL only. Apps and JMAP push
+      subscriptions store the URL they were given, so a hostname you own is
+      what lets the backend change without an app release.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate for DomainName, in us-east-1 (deploy/aws/certificate.yaml).
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 zone for DomainName; the stack writes the A/AAAA alias records.
   LogRetentionDays:
     Type: Number
     Default: 14
@@ -66,6 +83,7 @@ Parameters:
 
 Conditions:
   ReserveConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
 
 Resources:
   Table:
@@ -197,12 +215,102 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  # The relay on its own domain. CloudFront is only a TLS front: nothing is
+  # cached, and every request reaches the function as it arrived.
+  #
+  # Not the managed CachingDisabled policy: for GET, CloudFront forwards
+  # Authorization only when it is in the cache key, and an origin request
+  # policy may not list it. The poll (GET /v1/pending) needs it. With every
+  # TTL at 0 nothing is stored, so the key never selects a cached response.
+  NoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: HasDomain
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub jmap-apns-relay-${Stage}-no-cache
+        Comment: Nothing cached; Authorization forwarded on every method.
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 1
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers: [Authorization]
+          CookiesConfig: { CookieBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: HasDomain
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub jmap-apns-relay-${Stage}
+        Aliases: [!Ref DomainName]
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: function-url
+            # https://<id>.lambda-url.<region>.on.aws/ → the bare host
+            DomainName: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: function-url
+          # https-only, not redirect: a JMAP server will not resend a POST body
+          # after a redirect.
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          CachePolicyId: !Ref NoCachePolicy
+          # Managed AllViewerExceptHostHeader: every header (Content-Encoding
+          # for RFC 8291 bodies included) except Host, which must be the
+          # Function URL's own for Lambda to route the request.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+  DomainRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # CloudFront's fixed alias zone
+
+  DomainRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
 Outputs:
   AppStoreNotificationURL:
     Description: Paste into App Store Connect → App Information → App Store Server Notifications (Version 2).
-    Value: !Sub "${FunctionUrl.FunctionUrl}v1/appstore/notifications"
+    Value: !If
+      - HasDomain
+      - !Sub "https://${DomainName}/v1/appstore/notifications"
+      - !Sub "${FunctionUrl.FunctionUrl}v1/appstore/notifications"
   RelayURL:
-    Description: Set this as the relay URL (both fields) in the app's push settings.
+    Description: The URL to give apps. The own domain when there is one, else the Function URL.
+    Value: !If [HasDomain, !Sub "https://${DomainName}/", !GetAtt FunctionUrl.FunctionUrl]
+  FunctionURL:
+    Description: The bare Function URL. Keeps working behind the domain; do not hand it out.
     Value: !GetAtt FunctionUrl.FunctionUrl
   TableName:
     Value: !Ref Table

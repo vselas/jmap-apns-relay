@@ -7,12 +7,21 @@ redeploy it, and how to operate it. The container deployment in the
 ## What gets deployed
 
 ```
-JMAP server ──HTTPS──▶ Lambda Function URL ──▶ Lambda (provided.al2023, arm64, 256 MB)
-   (Stalwart,               (AWS TLS cert)          │        │            │
-    Fastmail…)                                       │        │            └──▶ APNs (api.push.apple.com)
-                                                     │        └──▶ SSM Parameter Store: auth token, .p8 key
-App ──register / poll──▶ same URL                    └──▶ DynamoDB table (on demand, TTL, PITR)
+JMAP server ──HTTPS──▶ push.example.com ──▶ CloudFront ──▶ Lambda Function URL ──▶ Lambda (provided.al2023, arm64, 256 MB)
+   (Stalwart,          (Route 53 alias)    (ACM cert,      (origin; AWS cert)        │        │            │
+    Fastmail…)                              no caching)                              │        │            └──▶ APNs
+                                                                                     │        └──▶ SSM: auth token, .p8 key
+App ──register / poll──▶ same name                                                   └──▶ DynamoDB (on demand, TTL, PITR)
 ```
+
+The domain is optional, and without it the relay is served on the bare Function
+URL. **Use one for anything you hand out.** The app stores the relay URL, and
+so does every mail server, because each JMAP push subscription keeps
+`<relay URL>/v1/push/<device id>` as its webhook. A name you own lets
+everything behind it change (a new stack, another region, Fargate, back to
+Docker) with one DNS change: no app release, no re-subscribing. A Function URL
+cannot be given a custom domain itself: Lambda routes on its own `Host` and
+serves only its own certificate. That is why CloudFront sits in front.
 
 One CloudFormation stack, [`deploy/aws/template.yaml`](../deploy/aws/template.yaml),
 owns everything except the secrets and the code bucket:
@@ -23,6 +32,9 @@ owns everything except the secrets and the code bucket:
 | Lambda function | `jmap-apns-relay-<stage>` | arm64, 256 MB, 15 s timeout. Reserved concurrency when the account allows (see [Quotas](#quotas)). |
 | Function URL | (output `RelayURL`) | Auth type `NONE`. The relay authenticates registration itself, and the webhook must stay public. |
 | Two Lambda permissions | | Public Function URLs need both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` (with `InvokedViaFunctionUrl`) since October 2025. |
+| CloudFront distribution | (output `RelayURL`) | Only with `DOMAIN_NAME`. Caching off, every method, all headers except `Host`, HTTP/2 and 3, IPv6. |
+| Cache policy | `jmap-apns-relay-<stage>-no-cache` | TTL 0 with `Authorization` in the key, so the poll's bearer token reaches the function (see below). |
+| Route 53 records | `A` and `AAAA` alias for the domain | In the zone the script finds for the name. |
 | IAM role | | DynamoDB on the table and its index; `ssm:GetParameters` under `/jmap-apns-relay/<stage>/*`; logs. |
 | Log group | `/aws/lambda/jmap-apns-relay-<stage>` | 14-day retention. |
 
@@ -33,6 +45,7 @@ Created by `scripts/deploy-lambda.sh`, outside the stack:
 | SSM SecureString | `/jmap-apns-relay/<stage>/auth-token` |
 | SSM SecureString | `/jmap-apns-relay/<stage>/apns-key` (the `.p8` PEM) |
 | S3 bucket | `jmap-apns-relay-code-<account>-<region>`: private, builds expire after 30 days |
+| Stack in **us-east-1** | `jmap-apns-relay-<stage>-certificate`: the ACM certificate for the domain, DNS-validated in the zone (CloudFront takes certificates only from us-east-1) |
 
 Secrets never pass through CloudFormation. The function reads them at cold
 start (`*_PARAMETER` environment variables), and a missing one stops the cold
@@ -45,14 +58,19 @@ start rather than starting an open relay.
 | Account | `892334470821` (dedicated), AWS CLI profile `orcamail` |
 | Region | `eu-central-1` |
 | Stack | `jmap-apns-relay-prod` |
-| URL | `https://ugat6u23sayxdah6ejcysp35jq0ttenj.lambda-url.eu-central-1.on.aws/` |
+| URL | `https://push.orcamail.app/` (zone `orcamail.app`, registered through Route 53 in this account) |
+| Function URL | `https://ugat6u23sayxdah6ejcysp35jq0ttenj.lambda-url.eu-central-1.on.aws/`: the origin, not for apps |
 | APNs | production (`api.push.apple.com`), key `M528HRT4VQ`, team `UA5PQ9SVT8`, topic `de.vselas.orcamail` |
 | App Store gating | off (no StoreKit product yet) |
 | Auth token | SSM `/jmap-apns-relay/prod/auth-token`; maintainer copy in `~/.config/orcamail/relay-auth-token` (mode 600) |
 
-OrcaMail ships this URL as its default relay (`PushRelayConfiguration.hostedURL`
-in the app). **Changing the URL breaks every installed app**, so never delete
-and recreate the Function URL. Redeploying code does not change it.
+OrcaMail ships `https://push.orcamail.app/` as its default relay
+(`PushRelayConfiguration.hostedURL` in the app). **That name must keep
+answering for as long as any copy of the app is installed**: never let the
+domain lapse (turn on auto-renew), and never delete the zone. What is behind
+it can change freely. The Function URL also keeps working, so a TestFlight
+build that shipped it before the domain existed still works. Do not delete and
+recreate the Function URL while such builds are around.
 
 ## Prerequisites
 
@@ -85,14 +103,18 @@ mkdir -p ~/.config/orcamail && chmod 700 ~/.config/orcamail
 APNS_KEY_FILE=path/to/AuthKey_M528HRT4VQ.p8 \
 APNS_KEY_ID=M528HRT4VQ APNS_TEAM_ID=UA5PQ9SVT8 APNS_TOPIC=de.vselas.orcamail \
 APNS_ENVIRONMENT=production \
+DOMAIN_NAME=push.orcamail.app \
 RELAY_AUTH_TOKEN="$(cat ~/.config/orcamail/relay-auth-token)" \
   scripts/deploy-lambda.sh
 ```
 
 The script stores both secrets (writing them from files, so neither appears in
 a process listing), creates the code bucket, uploads the zip under a
-content-addressed key, and deploys the stack. It then prints the URL and runs
-a smoke test against `/healthz` and `/v1/capabilities`.
+content-addressed key, and deploys the stack. With `DOMAIN_NAME` it first deploys the certificate stack in us-east-1 and
+waits for DNS validation, which takes a few minutes the first time. Then the
+main stack creates the CloudFront distribution, which takes another 5–10
+minutes. It then prints the URL and runs a smoke test against `/healthz` (on
+both the domain and the Function URL) and `/v1/capabilities`.
 
 Then exercise the whole protocol over the real URL:
 
@@ -111,11 +133,12 @@ export AWS_PROFILE=orcamail AWS_REGION=eu-central-1
 scripts/build-lambda.sh
 APNS_KEY_ID=M528HRT4VQ APNS_TEAM_ID=UA5PQ9SVT8 APNS_TOPIC=de.vselas.orcamail \
   scripts/deploy-lambda.sh
-python3 -I scripts/integration/smoke_live.py "$(aws cloudformation describe-stacks \
-  --stack-name jmap-apns-relay-prod --query "Stacks[0].Outputs[?OutputKey=='RelayURL'].OutputValue" --output text)"
+python3 -I scripts/integration/smoke_live.py https://push.orcamail.app/
 ```
 
-Without `APNS_KEY_FILE` / `RELAY_AUTH_TOKEN` the stored secrets are kept. An
+Without `APNS_KEY_FILE` / `RELAY_AUTH_TOKEN` the stored secrets are kept, and
+without `DOMAIN_NAME` the domain already on the stack is kept. (Only
+`DOMAIN_NAME=none` removes it, which you never want in production.) An
 unchanged zip is not a stack change. The deploy has no downtime: Lambda swaps
 versions between invocations.
 
@@ -131,6 +154,44 @@ defaults for the rest), or CloudFormation resets it. The parameters are:
 | `APPSTORE_APP_APPLE_ID` | empty | `AppStoreAppAppleId` |
 | `APPSTORE_ENVIRONMENT` | `Production` | `AppStoreEnvironment` |
 | `MAX_DEVICES_PER_SUBSCRIPTION` | `10` | `MaxDevicesPerSubscription` |
+| `DOMAIN_NAME` | the stack's current one | `DomainName` (plus `CertificateArn`, `HostedZoneId`, both derived) |
+
+## The domain
+
+**Adding one to an existing stack** is the same deploy with `DOMAIN_NAME` set.
+The Function URL does not change and keeps serving.
+
+**Prerequisites.** A public Route 53 hosted zone for the name (or a parent) in
+the same account. Registering a domain through Route 53 creates it. The domain
+must already resolve publicly, because ACM validates through public DNS. A
+registration still in progress, or a zone not yet delegated, leaves the
+certificate stack waiting until CloudFormation gives up. Check before
+deploying:
+
+```bash
+aws route53domains list-operations --region us-east-1   # REGISTER_DOMAIN must be SUCCESSFUL
+dig +short NS orcamail.app                              # must list the zone's awsdns servers
+```
+
+**What CloudFront does to requests.** Nothing that matters: no caching, and
+every header goes through except `Host`, which must be the Function URL's own.
+The relay never reads `Host`. One subtlety: for `GET`, CloudFront passes
+`Authorization` only when it is part of the cache key, and an origin request
+policy may not list it. So the stack uses its own cache policy, with every TTL
+0 and `Authorization` in the key, instead of the managed `CachingDisabled`. The
+poll (`GET /v1/pending`) would otherwise reach the function with no token and
+get 401. `smoke_live.py` covers it.
+
+**The Function URL stays public.** CloudFront's origin access control can sign
+Lambda requests, but for `POST` and `PUT` the sender must supply the body hash,
+and no JMAP server does. So the origin cannot be locked to CloudFront. That
+costs nothing: the webhook was always meant to be public, and the relay
+authenticates everything else itself.
+
+**Moving the backend** later (another stack, region or host): bring it up,
+smoke-test it on its own URL, then point the domain's records at it, through
+this stack's distribution origin or by replacing the records. Devices and
+subscriptions follow the name.
 
 ## APNs environments: which stack serves which build
 
@@ -292,8 +353,11 @@ aws ssm delete-parameters --names /jmap-apns-relay/prod/auth-token /jmap-apns-re
 aws s3 rb s3://jmap-apns-relay-code-892334470821-eu-central-1 --force
 ```
 
-Deleting the stack deletes the Function URL. A new stack gets a **different
-URL**, and every installed OrcaMail points at the old one.
+Deleting the stack deletes the distribution, the domain's records and the
+Function URL. A new stack with the same `DOMAIN_NAME` brings the name back,
+with a different Function URL behind it. Builds that shipped the old
+Function URL lose push. The certificate stack in us-east-1 is separate:
+`aws cloudformation delete-stack --region us-east-1 --stack-name jmap-apns-relay-prod-certificate`.
 
 ## Troubleshooting
 
@@ -306,3 +370,6 @@ URL**, and every installed OrcaMail points at the old one.
 | `InvalidProviderToken` | Wrong key id or team id, or a revoked key | Check with `Tools/apns-push.swift --check`, redeploy with the right values. |
 | Registration 401 | App and relay tokens differ | Compare the app's build setting with SSM; see [Secrets](#secrets-and-rotation). |
 | Cold start fails with "missing [...]" | An SSM parameter is gone | Redeploy with `RELAY_AUTH_TOKEN` / `APNS_KEY_FILE`. |
+| Certificate stack hangs in `CREATE_IN_PROGRESS` | The domain does not resolve publicly yet (registration pending, or not delegated to the zone) | Wait for the registration, check `dig NS`; CloudFormation retries until it times out, then re-run. |
+| Poll 401 through the domain, fine on the Function URL | `Authorization` not reaching the origin on `GET` | The cache policy must keep `Authorization` in the key (see [The domain](#the-domain)). |
+| 403 from CloudFront with "The request could not be satisfied" | The name is not in the distribution's aliases, or the certificate does not cover it | Redeploy with the right `DOMAIN_NAME`. |

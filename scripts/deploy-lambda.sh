@@ -17,6 +17,12 @@
 # Optional: STAGE (prod), APNS_ENVIRONMENT (production | sandbox),
 # RESERVED_CONCURRENCY (20).
 #
+# Own domain (recommended for anything you hand out): DOMAIN_NAME=push.example.com,
+# whose public Route 53 zone is in this account. The script deploys a
+# certificate stack in us-east-1 (CloudFront requires it there), then serves
+# the relay through CloudFront on that name. Once set, later deploys keep it
+# without passing it again; DOMAIN_NAME=none removes it.
+#
 # Selling push (App Store subscription required for APNs delivery):
 #   APPSTORE_PRODUCT_IDS=de.vselas.orcamail.pro.yearly,de.vselas.orcamail.pro.monthly
 #   APPSTORE_APP_APPLE_ID=1234567890     # App Store Connect → App Information → Apple ID
@@ -90,7 +96,36 @@ fi
 KEY="builds/$(shasum -a 256 "$ZIP" | cut -c1-16).zip"
 aws s3 cp --region "$REGION" --only-show-errors "$ZIP" "s3://$BUCKET/$KEY"
 
-# 3. The stack. A first create that failed leaves ROLLBACK_COMPLETE, which can
+# 3. Own domain: certificate in us-east-1, validated through the zone.
+# An unset DOMAIN_NAME keeps whatever the stack already serves, so a plain
+# code redeploy can never take the domain away from installed apps.
+current_param() {
+  aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+    --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue" --output text 2>/dev/null || true
+}
+if [[ -z "${DOMAIN_NAME:-}" ]]; then
+  DOMAIN_NAME=$(current_param DomainName)
+  [[ "$DOMAIN_NAME" == None ]] && DOMAIN_NAME=""
+  [[ -n "$DOMAIN_NAME" ]] && echo "Keeping domain $DOMAIN_NAME"
+fi
+[[ "$DOMAIN_NAME" == none ]] && DOMAIN_NAME=""
+CERTIFICATE_ARN="" HOSTED_ZONE_ID=""
+if [[ -n "$DOMAIN_NAME" ]]; then
+  # The longest public zone that is a suffix of the name.
+  HOSTED_ZONE_ID=$(aws route53 list-hosted-zones --output text \
+    --query "HostedZones[?Config.PrivateZone==\`false\`].[Name,Id]" |
+    awk -v d="$DOMAIN_NAME." '{ n=$1; if ((d == n || substr(d, length(d)-length(n)) == "." n) && length(n) > best) { best=length(n); id=$2 } } END { sub("/hostedzone/", "", id); print id }')
+  [[ -n "$HOSTED_ZONE_ID" ]] || { echo "No public Route 53 zone for $DOMAIN_NAME in this account" >&2; exit 1; }
+  CERT_STACK="jmap-apns-relay-$STAGE-certificate"
+  echo "Certificate for $DOMAIN_NAME (zone $HOSTED_ZONE_ID) in us-east-1; the first one waits for DNS validation"
+  aws cloudformation deploy --region us-east-1 --stack-name "$CERT_STACK" \
+    --template-file "$ROOT/deploy/aws/certificate.yaml" --no-fail-on-empty-changeset \
+    --parameter-overrides DomainName="$DOMAIN_NAME" HostedZoneId="$HOSTED_ZONE_ID"
+  CERTIFICATE_ARN=$(aws cloudformation describe-stacks --region us-east-1 --stack-name "$CERT_STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='CertificateArn'].OutputValue" --output text)
+fi
+
+# 4. The stack. A first create that failed leaves ROLLBACK_COMPLETE, which can
 # only be deleted, not updated.
 if [[ "$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null)" == ROLLBACK_COMPLETE ]]; then
   echo "Removing $STACK left in ROLLBACK_COMPLETE by a failed first create"
@@ -106,15 +141,24 @@ aws cloudformation deploy --region "$REGION" --stack-name "$STACK" \
     APNsEnvironment="$APNS_ENVIRONMENT" ReservedConcurrency="$RESERVED_CONCURRENCY" \
     AppStoreProductIds="${APPSTORE_PRODUCT_IDS:-}" AppStoreAppAppleId="${APPSTORE_APP_APPLE_ID:-}" \
     AppStoreEnvironment="${APPSTORE_ENVIRONMENT:-Production}" \
-    MaxDevicesPerSubscription="${MAX_DEVICES_PER_SUBSCRIPTION:-10}"
+    MaxDevicesPerSubscription="${MAX_DEVICES_PER_SUBSCRIPTION:-10}" \
+    DomainName="$DOMAIN_NAME" CertificateArn="$CERTIFICATE_ARN" HostedZoneId="$HOSTED_ZONE_ID"
 
-URL=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
-  --query "Stacks[0].Outputs[?OutputKey=='RelayURL'].OutputValue" --output text)
+output() {
+  aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+URL=$(output RelayURL)
+FUNCTION_URL=$(output FunctionURL)
 echo "Relay URL: $URL"
+[[ "$URL" != "$FUNCTION_URL" ]] && echo "Function URL (origin, not for apps): $FUNCTION_URL"
 if [[ -n "${APPSTORE_PRODUCT_IDS:-}" ]]; then
   echo "App Store Server Notifications V2 URL: ${URL}v1/appstore/notifications"
 fi
 
-# 4. Smoke test: the public endpoints answer, and the cold start loaded secrets.
-curl -fsS "${URL%/}/healthz" >/dev/null && echo "healthz ok"
+# 5. Smoke test: the public endpoints answer, and the cold start loaded secrets.
+# Through the domain too; a fresh name can take a minute to resolve everywhere.
+for u in "$FUNCTION_URL" "$URL"; do
+  curl -fsS --retry 6 --retry-delay 10 --retry-all-errors "${u%/}/healthz" >/dev/null && echo "healthz ok: $u"
+done
 curl -fsS "${URL%/}/v1/capabilities" && echo

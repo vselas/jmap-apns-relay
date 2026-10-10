@@ -223,6 +223,12 @@ The script prints the relay URL (`https://<id>.lambda-url.<region>.on.aws/`);
 clients use it for both the app-facing and the server-facing relay address. Keep
 the auth token: clients need it to register.
 
+**Before handing the URL out, put it on a domain you own.** Apps and every JMAP
+push subscription store it, so a bare Function URL can never change. Add
+`DOMAIN_NAME=push.example.com` (with a public Route 53 zone in the same account)
+and the script puts CloudFront in front, with a certificate and DNS records.
+See [the runbook](docs/deploy-aws.md#the-domain).
+
 What differs from the container:
 
 | | Container | Lambda |
