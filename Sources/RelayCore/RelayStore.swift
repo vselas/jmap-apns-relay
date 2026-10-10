@@ -46,11 +46,17 @@ public struct DeviceRegistration: Sendable, Codable, Equatable {
     /// APNs device token; absent in dev/poll mode.
     public var apnsToken: String?
     public var registeredAt: Date
+    /// The App Store subscription that pays for this device's push
+    /// (`Entitlement.originalTransactionId`). Nil on a relay that does not
+    /// sell push, and absent from snapshots written before it did, which is
+    /// why it is optional rather than versioning the snapshot.
+    public var entitlementId: String?
 
-    public init(deviceId: String, apnsToken: String? = nil, registeredAt: Date = .now) {
+    public init(deviceId: String, apnsToken: String? = nil, registeredAt: Date = .now, entitlementId: String? = nil) {
         self.deviceId = deviceId
         self.apnsToken = apnsToken
         self.registeredAt = registeredAt
+        self.entitlementId = entitlementId
     }
 }
 
@@ -109,6 +115,16 @@ public protocol RelayStorage: Sendable {
     /// that re-registered in the meantime keeps its new one.
     func invalidateAPNsToken(deviceId: String, token: String) async throws
     func isReady() async -> Bool
+
+    // MARK: Entitlements (only used when the relay sells push)
+
+    func entitlement(id: String) async throws -> Entitlement?
+    /// Stores `entitlement`, keeping whichever of it and the stored one Apple
+    /// signed later (`Entitlement.merged`). Returns what is now stored.
+    @discardableResult
+    func upsertEntitlement(_ entitlement: Entitlement) async throws -> Entitlement
+    /// Device ids currently registered against an entitlement.
+    func devices(entitlementId: String) async throws -> [String]
 }
 
 public enum RelayLimits {
@@ -122,6 +138,7 @@ public enum RelayLimits {
 public actor RelayStore: RelayStorage {
     private var registrations: [String: DeviceRegistration] = [:]
     private var pending: [String: [PendingPush]] = [:]
+    private var entitlements: [String: Entitlement] = [:]
     private let persistenceURL: URL?
     private let maxQueue = RelayLimits.maxPendingPerDevice
 
@@ -141,6 +158,7 @@ public actor RelayStore: RelayStorage {
             }
             registrations = snapshot.registrations
             pending = snapshot.pending
+            entitlements = snapshot.entitlements ?? [:]
         } else {
             let legacy = try decoder.decode(LegacySnapshot.self, from: data)
             registrations = legacy.registrations
@@ -159,6 +177,8 @@ public actor RelayStore: RelayStorage {
         var version: Int
         var registrations: [String: DeviceRegistration]
         var pending: [String: [PendingPush]]
+        /// Optional so a version-1 snapshot from before entitlements reads.
+        var entitlements: [String: Entitlement]? = nil
     }
 
     private struct LegacySnapshot: Codable {
@@ -242,12 +262,33 @@ public actor RelayStore: RelayStorage {
 
     public func isReady() -> Bool { persistenceError == nil }
 
+    public func entitlement(id: String) -> Entitlement? { entitlements[id] }
+
+    @discardableResult
+    public func upsertEntitlement(_ entitlement: Entitlement) throws -> Entitlement {
+        let previous = entitlements[entitlement.originalTransactionId]
+        let merged = previous?.merged(with: entitlement) ?? entitlement
+        entitlements[entitlement.originalTransactionId] = merged
+        do {
+            try persist()
+        } catch {
+            entitlements[entitlement.originalTransactionId] = previous
+            throw error
+        }
+        return merged
+    }
+
+    public func devices(entitlementId: String) -> [String] {
+        registrations.values.filter { $0.entitlementId == entitlementId }.map(\.deviceId).sorted()
+    }
+
     private func persist() throws {
         guard let persistenceURL else { return }
         let snapshot = Snapshot(
             version: Snapshot.currentVersion,
             registrations: registrations,
-            pending: pending
+            pending: pending,
+            entitlements: entitlements.isEmpty ? nil : entitlements
         )
         do {
             let data = try JSONEncoder().encode(snapshot)

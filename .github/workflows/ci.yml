@@ -37,6 +37,10 @@ jobs:
         run: scripts/build-lambda.sh
       - name: Lambda integration
         run: scripts/test-lambda-local.sh
+      - name: Lambda integration (App Store entitlements on)
+        run: PAID=1 scripts/test-lambda-local.sh
+      - name: DynamoDB store against DynamoDB Local
+        run: scripts/test-dynamodb-local.sh
       - uses: actions/upload-artifact@v4
         with:
           name: relay-lambda-arm64

@@ -46,6 +46,18 @@ actor FakeDynamoDB: AWSJSONTransport {
         case "PutItem":
             let item = request["Item"] as? [String: Any] ?? [:]
             let (pk, sk) = keys(item)
+            if let condition = request["ConditionExpression"] as? String {
+                // The one condition the store writes: newer-or-equal signedAt.
+                precondition(condition == "attribute_not_exists(pk) OR signedAt <= :signedAt", condition)
+                let values = request["ExpressionAttributeValues"] as? [String: Any] ?? [:]
+                let incoming = Double((values[":signedAt"] as? [String: Any])?["N"] as? String ?? "") ?? 0
+                if let existing = items[pk]?[sk],
+                    let stored = Double((existing["signedAt"] as? [String: Any])?["N"] as? String ?? ""),
+                    stored > incoming
+                {
+                    throw AWSError.service(status: 400, type: "ConditionalCheckFailedException", message: "condition")
+                }
+            }
             items[pk, default: [:]][sk] = item
             return [:]
         case "GetItem":
@@ -67,6 +79,14 @@ actor FakeDynamoDB: AWSJSONTransport {
             item.removeValue(forKey: "apnsToken")
             items[pk]?[sk] = item
             return [:]
+        case "Query" where request["IndexName"] as? String == "byEntitlement":
+            let values = request["ExpressionAttributeValues"] as? [String: Any] ?? [:]
+            let id = (values[":id"] as? [String: Any])?["S"] as? String
+            // A sparse index: only items carrying entitlementId, keys only.
+            let matches = items.values.flatMap(\.values).filter {
+                ($0["entitlementId"] as? [String: Any])?["S"] as? String == id
+            }
+            return ["Items": matches.map { ["pk": $0["pk"] ?? [:], "sk": $0["sk"] ?? [:], "entitlementId": $0["entitlementId"] ?? [:]] }]
         case "Query":
             let values = request["ExpressionAttributeValues"] as? [String: Any] ?? [:]
             let pk = (values[":pk"] as? [String: Any])?["S"] as? String ?? ""

@@ -37,6 +37,26 @@ Parameters:
     Description: >
       Hard ceiling on simultaneous instances. The webhook is unauthenticated by
       design, so this bounds what a flood of junk requests can cost.
+  AppStoreProductIds:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated product ids that grant push. Empty means the relay does
+      not sell push and every registration with the auth token is served.
+  AppStoreAppAppleId:
+    Type: String
+    Default: ""
+    AllowedPattern: "[0-9]*"
+    Description: The app's numeric App Store id (required when selling push in Production).
+  AppStoreEnvironment:
+    Type: String
+    Default: Production
+    AllowedValues: [Production, Sandbox]
+    Description: Production accepts App Store and TestFlight purchases; Sandbox, sandbox-account ones.
+  MaxDevicesPerSubscription:
+    Type: Number
+    Default: 10
+    MinValue: 1
   LogRetentionDays:
     Type: Number
     Default: 14
@@ -53,9 +73,18 @@ Resources:
       AttributeDefinitions:
         - { AttributeName: pk, AttributeType: S }
         - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: entitlementId, AttributeType: S }
       KeySchema:
         - { AttributeName: pk, KeyType: HASH }
         - { AttributeName: sk, KeyType: RANGE }
+      # Sparse: only paid registrations carry entitlementId. Counting a
+      # subscription's devices is one Query on it.
+      GlobalSecondaryIndexes:
+        - IndexName: byEntitlement
+          KeySchema:
+            - { AttributeName: entitlementId, KeyType: HASH }
+            - { AttributeName: pk, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true
@@ -92,7 +121,9 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
-                Resource: !GetAtt Table.Arn
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub ${Table.Arn}/index/byEntitlement
               - Effect: Allow
                 Action: ssm:GetParameters
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jmap-apns-relay/${Stage}/*
@@ -131,6 +162,10 @@ Resources:
           APNS_TEAM_ID: !Ref APNsTeamId
           APNS_TOPIC: !Ref APNsTopic
           APNS_ENVIRONMENT: !Ref APNsEnvironment
+          APPSTORE_PRODUCT_IDS: !Ref AppStoreProductIds
+          APPSTORE_APP_APPLE_ID: !Ref AppStoreAppAppleId
+          APPSTORE_ENVIRONMENT: !Ref AppStoreEnvironment
+          APPSTORE_MAX_DEVICES: !Ref MaxDevicesPerSubscription
 
   FunctionUrl:
     Type: AWS::Lambda::Url
@@ -158,6 +193,9 @@ Resources:
       InvokedViaFunctionUrl: true
 
 Outputs:
+  AppStoreNotificationURL:
+    Description: Paste into App Store Connect → App Information → App Store Server Notifications (Version 2).
+    Value: !Sub "${FunctionUrl.FunctionUrl}v1/appstore/notifications"
   RelayURL:
     Description: Set this as the relay URL (both fields) in the app's push settings.
     Value: !GetAtt FunctionUrl.FunctionUrl

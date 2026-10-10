@@ -11,6 +11,13 @@ import RelayCore
 /// |------------------|------------------------|----------------------------------------|
 /// | `device#<id>`    | `registration`         | `apnsToken?`, `registeredAt`           |
 /// | `device#<id>`    | `push#<time>#<nonce>`  | `body` (binary), `contentEncoding?`, `receivedAt`, `expiresAt` |
+/// | `entitlement#<originalTransactionId>` | `entitlement` | `productId`, `expiresAt?` → `periodEndsAt`, `revokedAt?`, `signedAt` |
+///
+/// A registration that is paid for also carries `entitlementId`, which the
+/// `byEntitlement` index (keys `entitlementId` + `pk`, keys only) projects so
+/// counting a subscription's devices is one Query, not a scan. The period end
+/// is stored as `periodEndsAt`, never `expiresAt`: that name is the table's
+/// TTL attribute, and DynamoDB would delete the entitlement when it lapsed.
 ///
 /// * A push is its own item, so two webhooks landing on two instances both
 ///   survive; the sort key keeps them in arrival order.
@@ -52,6 +59,9 @@ public struct DynamoDBRelayStore: RelayStorage {
         ]
         if let token = registration.apnsToken {
             item["apnsToken"] = ["S": token]
+        }
+        if let entitlementId = registration.entitlementId {
+            item["entitlementId"] = ["S": entitlementId]
         }
         _ = try await dynamo("PutItem", ["TableName": table, "Item": item])
     }
@@ -127,6 +137,79 @@ public struct DynamoDBRelayStore: RelayStorage {
     }
 
     public func isReady() async -> Bool { true }
+
+    // MARK: - Entitlements
+
+    static let entitlementIndex = "byEntitlement"
+    static func entitlementKey(_ id: String) -> [String: Any] {
+        ["pk": ["S": "entitlement#\(id)"], "sk": ["S": "entitlement"]]
+    }
+
+    public func entitlement(id: String) async throws -> Entitlement? {
+        let response = try await dynamo("GetItem", [
+            "TableName": table, "Key": Self.entitlementKey(id), "ConsistentRead": true,
+        ])
+        return (response["Item"] as? [String: Any]).flatMap { Self.decodeEntitlement($0, id: id) }
+    }
+
+    @discardableResult
+    public func upsertEntitlement(_ entitlement: Entitlement) async throws -> Entitlement {
+        var item = Self.entitlementKey(entitlement.originalTransactionId)
+        item["productId"] = ["S": entitlement.productId]
+        item["signedAt"] = ["N": Self.number(entitlement.signedAt)]
+        if let expiresAt = entitlement.expiresAt { item["periodEndsAt"] = ["N": Self.number(expiresAt)] }
+        if let revokedAt = entitlement.revokedAt { item["revokedAt"] = ["N": Self.number(revokedAt)] }
+        do {
+            // Written only when at least as new as what is stored: two
+            // instances applying a renewal and a late, older notification in
+            // either order leave the newer one.
+            _ = try await dynamo("PutItem", [
+                "TableName": table,
+                "Item": item,
+                "ConditionExpression": "attribute_not_exists(pk) OR signedAt <= :signedAt",
+                "ExpressionAttributeValues": [":signedAt": ["N": Self.number(entitlement.signedAt)]],
+            ])
+            return entitlement
+        } catch AWSError.service(_, "ConditionalCheckFailedException", _) {
+            // Something newer is already there; that is the answer.
+            return try await self.entitlement(id: entitlement.originalTransactionId) ?? entitlement
+        }
+    }
+
+    public func devices(entitlementId: String) async throws -> [String] {
+        var devices: [String] = []
+        var startKey: [String: Any]?
+        repeat {
+            var request: [String: Any] = [
+                "TableName": table,
+                "IndexName": Self.entitlementIndex,
+                "KeyConditionExpression": "entitlementId = :id",
+                "ExpressionAttributeValues": [":id": ["S": entitlementId]],
+            ]
+            if let startKey { request["ExclusiveStartKey"] = startKey }
+            let response = try await dynamo("Query", request)
+            for item in response["Items"] as? [[String: Any]] ?? [] {
+                if let pk = (item["pk"] as? [String: Any])?["S"] as? String, pk.hasPrefix("device#") {
+                    devices.append(String(pk.dropFirst("device#".count)))
+                }
+            }
+            startKey = response["LastEvaluatedKey"] as? [String: Any]
+        } while startKey != nil
+        return devices.sorted()
+    }
+
+    static func decodeEntitlement(_ item: [String: Any], id: String) -> Entitlement? {
+        guard let productId = (item["productId"] as? [String: Any])?["S"] as? String,
+            let signedAt = date(item["signedAt"])
+        else { return nil }
+        return Entitlement(
+            originalTransactionId: id,
+            productId: productId,
+            expiresAt: date(item["periodEndsAt"]),
+            revokedAt: date(item["revokedAt"]),
+            signedAt: signedAt
+        )
+    }
 
     // MARK: - Helpers
 
@@ -206,7 +289,8 @@ public struct DynamoDBRelayStore: RelayStorage {
         DeviceRegistration(
             deviceId: deviceId,
             apnsToken: (item["apnsToken"] as? [String: Any])?["S"] as? String,
-            registeredAt: date(item["registeredAt"]) ?? .distantPast
+            registeredAt: date(item["registeredAt"]) ?? .distantPast,
+            entitlementId: (item["entitlementId"] as? [String: Any])?["S"] as? String
         )
     }
 

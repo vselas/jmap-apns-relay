@@ -3,6 +3,8 @@
 # provided.al2023 image's runtime interface emulator, against DynamoDB Local and a
 # Parameter Store stub, with a throwaway APNs key. Then drives the whole relay
 # protocol through Function URL events. Leaves nothing running.
+#
+#   PAID=1 scripts/test-lambda-local.sh   # with App Store entitlements on
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BOOTSTRAP="$ROOT/.build/lambda/bootstrap"
@@ -34,8 +36,9 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 "${AWS[@]}" dynamodb create-table --endpoint-url http://relay-it-ddb:8000 --table-name relay \
-  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S AttributeName=entitlementId,AttributeType=S \
   --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
+  --global-secondary-indexes 'IndexName=byEntitlement,KeySchema=[{AttributeName=entitlementId,KeyType=HASH},{AttributeName=pk,KeyType=RANGE}],Projection={ProjectionType=KEYS_ONLY}' \
   --billing-mode PAY_PER_REQUEST >/dev/null
 
 docker run -d --name relay-it-fn --network "$NET" --platform "$PLATFORM" -p "$PORT:8080" \
@@ -45,12 +48,15 @@ docker run -d --name relay-it-fn --network "$NET" --platform "$PLATFORM" -p "$PO
   -e RELAY_MODE=production -e DYNAMODB_TABLE=relay \
   -e RELAY_AUTH_TOKEN_PARAMETER=/jmap-apns-relay/it/auth-token -e APNS_KEY_PARAMETER=/jmap-apns-relay/it/apns-key \
   -e APNS_KEY_ID=ABCDE12345 -e APNS_TEAM_ID=ABCDE12345 -e APNS_TOPIC=com.example.relay-it -e APNS_ENVIRONMENT=sandbox \
+  ${PAID:+-e APPSTORE_PRODUCT_IDS=de.vselas.orcamail.pro -e APPSTORE_ENVIRONMENT=Sandbox} \
   public.ecr.aws/lambda/provided:al2023 bootstrap >/dev/null
 sleep 2
 
 status=0
+driver=drive.py
+[[ -n "${PAID:-}" ]] && driver=drive_paid.py
 RELAY_INVOKE_URL="http://localhost:$PORT/2015-03-31/functions/function/invocations" \
-  python3 -I "$ROOT/scripts/integration/drive.py" || status=$?
+  python3 -I "$ROOT/scripts/integration/$driver" || status=$?
 echo "--- relay log"
 docker logs relay-it-fn 2>&1 | grep -E '\[push\]|INIT REPORT|error' || true
 exit $status

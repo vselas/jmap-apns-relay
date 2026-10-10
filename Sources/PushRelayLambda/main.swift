@@ -3,6 +3,7 @@ import Foundation
 import AWSLambdaEvents
 import HummingbirdLambda
 import RelayAWS
+import RelayAppStore
 import RelayCore
 
 /// The relay as an AWS Lambda behind a Function URL.
@@ -29,12 +30,25 @@ guard let table = environment["DYNAMODB_TABLE"], !table.isEmpty else {
 }
 let store = DynamoDBRelayStore(transport: transport, table: table)
 let sender = try await makeSender(runtime: runtime, httpClient: httpClient, ownsClient: false)
-if runtime.authToken == nil {
+
+// Selling push: APPSTORE_PRODUCT_IDS turns it on. A registration then needs
+// Apple's signature on an active subscription *in addition to* the shared
+// token: the token keeps scripted clients out, the subscription is what pays.
+let entitlements = try AppStoreEntitlementVerifier.fromEnvironment(environment).map {
+    EntitlementPolicy(
+        verifier: $0,
+        maxDevicesPerEntitlement: environment["APPSTORE_MAX_DEVICES"].flatMap(Int.init) ?? 10
+    )
+}
+if entitlements != nil {
+    relayLog("[push] App Store entitlements required for APNs delivery")
+} else if runtime.authToken == nil {
     relayLog("[push] WARNING: RELAY_AUTH_TOKEN is not set — /v1/register accepts any device id.")
 }
 
 let router = buildRouter(
-    context: LambdaContext.self, store: store, sender: sender, authToken: runtime.authToken
+    context: LambdaContext.self, store: store, sender: sender,
+    authToken: runtime.authToken, entitlements: entitlements
 )
 relayLog("[push] Lambda relay ready (mode \(runtime.mode.rawValue), table \(table))")
 let lambda = FunctionURLLambdaFunction(router: router)

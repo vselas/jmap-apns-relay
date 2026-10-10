@@ -16,6 +16,12 @@
 #
 # Optional: STAGE (prod), APNS_ENVIRONMENT (production | sandbox),
 # RESERVED_CONCURRENCY (20).
+#
+# Selling push (App Store subscription required for APNs delivery):
+#   APPSTORE_PRODUCT_IDS=de.vselas.orcamail.pro.yearly,de.vselas.orcamail.pro.monthly
+#   APPSTORE_APP_APPLE_ID=1234567890     # App Store Connect → App Information → Apple ID
+#   APPSTORE_ENVIRONMENT=Production      # or Sandbox
+#   MAX_DEVICES_PER_SUBSCRIPTION=10
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 STAGE=${STAGE:-prod}
@@ -83,11 +89,17 @@ aws cloudformation deploy --region "$REGION" --stack-name "$STACK" \
   --parameter-overrides \
     Stage="$STAGE" CodeBucket="$BUCKET" CodeKey="$KEY" \
     APNsKeyId="$APNS_KEY_ID" APNsTeamId="$APNS_TEAM_ID" APNsTopic="$APNS_TOPIC" \
-    APNsEnvironment="$APNS_ENVIRONMENT" ReservedConcurrency="$RESERVED_CONCURRENCY"
+    APNsEnvironment="$APNS_ENVIRONMENT" ReservedConcurrency="$RESERVED_CONCURRENCY" \
+    AppStoreProductIds="${APPSTORE_PRODUCT_IDS:-}" AppStoreAppAppleId="${APPSTORE_APP_APPLE_ID:-}" \
+    AppStoreEnvironment="${APPSTORE_ENVIRONMENT:-Production}" \
+    MaxDevicesPerSubscription="${MAX_DEVICES_PER_SUBSCRIPTION:-10}"
 
 URL=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='RelayURL'].OutputValue" --output text)
 echo "Relay URL: $URL"
+if [[ -n "${APPSTORE_PRODUCT_IDS:-}" ]]; then
+  echo "App Store Server Notifications V2 URL: ${URL}v1/appstore/notifications"
+fi
 
 # 4. Smoke test: the public endpoints answer, and the cold start loaded secrets.
 curl -fsS "${URL%/}/healthz" >/dev/null && echo "healthz ok"

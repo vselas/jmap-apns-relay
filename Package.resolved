@@ -1,6 +1,15 @@
 {
-  "originHash" : "f927435f3a38b9ddc41875379482e04f74d728802802b6f436a99aaeffd1a9ae",
+  "originHash" : "0469212300a8ec89c0d07d69451e0f76f70cba34da6bb2782e7f5b2f2f6812e4",
   "pins" : [
+    {
+      "identity" : "app-store-server-library-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/app-store-server-library-swift.git",
+      "state" : {
+        "revision" : "ac7d41d3ef564265d6e8028357a7f4e5812f54da",
+        "version" : "6.0.0"
+      }
+    },
     {
       "identity" : "async-http-client",
       "kind" : "remoteSourceControl",
@@ -35,6 +44,15 @@
       "state" : {
         "revision" : "3877a5060e85ae33e3b9fe51ab581784f65ec80e",
         "version" : "1.0.3"
+      }
+    },
+    {
+      "identity" : "jwt-kit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/vapor/jwt-kit.git",
+      "state" : {
+        "revision" : "2033b3e661238dda3d30e36a2d40987499d987de",
+        "version" : "5.2.0"
       }
     },
     {
@@ -132,8 +150,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/apple/swift-crypto.git",
       "state" : {
-        "revision" : "47d3869a7291f085c1fb9fb1e6d3b97a793f45c6",
-        "version" : "4.5.1"
+        "revision" : "95ba0316a9b733e92bb6b071255ff46263bbe7dc",
+        "version" : "3.15.1"
       }
     },
     {

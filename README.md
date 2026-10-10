@@ -248,6 +248,54 @@ returns 404. Logs are kept 14 days.
 `BadDeviceToken`. Run a second stack (`STAGE=sandbox APNS_ENVIRONMENT=sandbox`)
 when both kinds of build need push at once.
 
+## Selling push: App Store subscriptions
+
+A relay can require an active App Store subscription before it delivers to
+APNs. Set `APPSTORE_PRODUCT_IDS` and it does; leave it unset and nothing changes.
+
+| Variable | Meaning |
+|---|---|
+| `APPSTORE_PRODUCT_IDS` | Comma-separated product ids that grant push. Turns the feature on. |
+| `APPSTORE_BUNDLE_ID` | Defaults to `APNS_TOPIC`. |
+| `APPSTORE_APP_APPLE_ID` | The app's numeric App Store id; required for `Production`. |
+| `APPSTORE_ENVIRONMENT` | `Production` (default; App Store and TestFlight) or `Sandbox`. `Xcode` and `LocalTesting` are refused: Apple's library skips signature checks for them. |
+| `APPSTORE_MAX_DEVICES` | Registrations one subscription may hold (default 10; each account on each device is one). |
+
+**How a client proves it paid.** `POST /v1/register` gains an optional
+`signedTransaction`: the StoreKit 2 `Transaction.jwsRepresentation` for the
+subscription. The relay verifies it with Apple's
+[App Store Server Library](https://github.com/apple/app-store-server-library-swift):
+the ES256 signature, the `x5c` chain to **Apple Root CA - G3** (embedded and
+fingerprint-checked), Apple's receipt-signing OIDs, online revocation, bundle id,
+environment and product. It then records the subscription under its
+`originalTransactionId` and links the device to it. Later registrations from
+the same device (a new APNs token, every launch) need no proof.
+
+Refusals carry a JSON `error` the app can act on:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 402 | `entitlementRequired` | No proof, and none on file for this device. |
+| 402 | `entitlementInvalid` | Not signed by Apple, or not for this app or product. |
+| 402 | `entitlementExpired` | Genuine, but the period has ended or it was refunded. |
+| 403 | `deviceLimitReached` | The subscription already holds `maxDevices` registrations. |
+| 503 | `entitlementUnavailable` | Apple's revocation check did not answer; retry. |
+
+The shared `RELAY_AUTH_TOKEN` is still required on top: the subscription is what
+pays, the token keeps scripted clients away from registration.
+
+**What stays free.** The webhook still queues every message, so the JMAP
+subscription's verification code reaches `/v1/pending` before anyone pays. Only
+the APNs leg is gated: an unpaid device's webhooks answer 200 and send nothing.
+
+**Keeping current.** Point App Store Connect's *App Store Server Notifications*
+(Version 2) at `https://<relay>/v1/appstore/notifications`; the deploy script
+prints the URL. Renewals, billing-grace periods, expiries, refunds and refund
+reversals then update the subscription without the app. Each notification is
+verified like a transaction, and an older one arriving after a newer one is
+ignored. Pushes keep flowing for an hour past a period's end, so a renewal
+racing its notification never drops one.
+
 ## Build & test from source
 
 ```bash
@@ -256,6 +304,8 @@ swift test
 swift build -c release
 scripts/check-protocol-fixture.sh --self
 scripts/build-lambda.sh && scripts/test-lambda-local.sh   # Lambda, needs Docker
+PAID=1 scripts/test-lambda-local.sh                       # …with entitlements on
+scripts/test-dynamodb-local.sh                            # DynamoDB store vs DynamoDB Local
 ```
 
 Requires Swift 6.2+ (the Lambda zip builds in the `swift:6.3.3-amazonlinux2023` image). The Docker image is built from the [`Dockerfile`](Dockerfile)
