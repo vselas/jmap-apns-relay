@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  TLS certificate for the relay's own domain. CloudFront only accepts ACM
+  certificates from us-east-1, so this stack is deployed there, separately
+  from the relay stack (scripts/deploy-lambda.sh does both).
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: The relay's hostname, e.g. push.example.com.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: The public Route 53 zone the hostname lives in, in this account.
+
+Resources:
+  # DNS validation with HostedZoneId: CloudFormation writes the validation
+  # record itself, and ACM renews the certificate as long as it stays.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+Outputs:
+  CertificateArn:
+    Value: !Ref Certificate
