@@ -26,7 +26,9 @@ push addressed to the right device.
 Written in Swift with [Hummingbird](https://github.com/hummingbird-project/hummingbird);
 ES256 provider tokens via [swift-crypto](https://github.com/apple/swift-crypto),
 HTTP/2 to Apple via [async-http-client](https://github.com/swift-server/async-http-client).
-No database — device registrations and the small pending queue persist to a JSON file.
+Two deployments from one codebase: a **container** that keeps device registrations
+and the small pending queue in a JSON file, and an **AWS Lambda** that keeps them
+in DynamoDB (see [Deploy to AWS Lambda](#deploy-to-aws-lambda)).
 
 ## Quick start (Docker)
 
@@ -183,6 +185,69 @@ checkout to additionally require both repositories' copies to match.
 **Never commit the `.p8`** — it can send push to every user of your app. Mount
 it as a secret.
 
+## Deploy to AWS Lambda
+
+The same router runs as an ARM64 Lambda behind a
+[Function URL](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html),
+which supplies HTTPS with a publicly trusted certificate — nothing to configure,
+and every JMAP server trusts it. State moves to an on-demand DynamoDB table,
+secrets to Parameter Store. At small scale this stays inside AWS's free tiers.
+
+```
+JMAP server ──▶ Function URL (HTTPS) ──▶ Lambda (provided.al2023, arm64) ──▶ APNs
+                                              │
+                          DynamoDB (pk/sk, TTL) · SSM SecureString ×2
+```
+
+Everything is in [`deploy/aws/template.yaml`](deploy/aws/template.yaml) (one
+CloudFormation stack) and two scripts:
+
+```bash
+export AWS_PROFILE=relay AWS_REGION=eu-central-1
+
+scripts/build-lambda.sh                 # Docker → .build/lambda/relay-lambda.zip
+scripts/test-lambda-local.sh            # optional: the zip in the Lambda emulator vs DynamoDB Local
+
+# First deploy stores both secrets; later deploys can omit them.
+APNS_KEY_FILE=~/keys/AuthKey_ABCDE12345.p8 \
+APNS_KEY_ID=ABCDE12345 APNS_TEAM_ID=UA5PQ9SVT8 APNS_TOPIC=com.example.app \
+RELAY_AUTH_TOKEN="$(openssl rand -base64 48)" \
+  scripts/deploy-lambda.sh
+```
+
+The script prints the relay URL (`https://<id>.lambda-url.<region>.on.aws/`);
+clients use it for both the app-facing and the server-facing relay address. Keep
+the auth token: clients need it to register.
+
+What differs from the container:
+
+| | Container | Lambda |
+|---|---|---|
+| State | `STATE_PATH` JSON file | `DYNAMODB_TABLE` |
+| `.p8` key | `APNS_KEY_PATH` (mounted file) | `APNS_KEY_PARAMETER` → `APNS_KEY` (PEM text) |
+| Auth token | `RELAY_AUTH_TOKEN` | `RELAY_AUTH_TOKEN_PARAMETER` → `RELAY_AUTH_TOKEN` |
+| TLS | `TLS_CERT` / `TLS_KEY` | the Function URL's |
+
+Any `<NAME>_PARAMETER` variable is resolved from Parameter Store (decrypted) at
+cold start into `<NAME>`; a plain `<NAME>` wins, which keeps local runs AWS-free.
+A missing parameter stops the cold start rather than starting an open relay.
+
+**Table layout.** One item per registration (`pk = device#<id>`,
+`sk = registration`) and one item per queued push (`sk = push#<time>#<nonce>`),
+so concurrent instances never overwrite each other's queue. Queued pushes carry
+an `expiresAt` TTL of one day — the queue exists for the client's verification
+poll, which comes within minutes — and a drain returns at most the newest 50.
+
+**Cost control.** The webhook is unauthenticated by design, so the function has
+a reserved concurrency (`RESERVED_CONCURRENCY`, default 20) that caps what a
+flood can cost; a request for an unknown device costs one DynamoDB read and
+returns 404. Logs are kept 14 days.
+
+**APNs environment.** One stack talks to one APNs host, and it must match the
+`aps-environment` the installed build was *signed* with; a mismatch answers
+`BadDeviceToken`. Run a second stack (`STAGE=sandbox APNS_ENVIRONMENT=sandbox`)
+when both kinds of build need push at once.
+
 ## Build & test from source
 
 ```bash
@@ -190,9 +255,10 @@ swift build
 swift test
 swift build -c release
 scripts/check-protocol-fixture.sh --self
+scripts/build-lambda.sh && scripts/test-lambda-local.sh   # Lambda, needs Docker
 ```
 
-Requires Swift 6.2+. The Docker image is built from the [`Dockerfile`](Dockerfile)
+Requires Swift 6.2+ (the Lambda zip builds in the `swift:6.3.3-amazonlinux2023` image). The Docker image is built from the [`Dockerfile`](Dockerfile)
 at the repo root. The example Compose file pins release `0.3.0`; use `:edge`
 deliberately when testing unreleased `main` behavior.
 

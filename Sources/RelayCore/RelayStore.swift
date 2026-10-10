@@ -3,7 +3,7 @@ import Foundation
 /// Writes a line to stdout with an immediate `write(2)`, so `[push]` logs show
 /// up live in `docker logs` — a piped stdout is otherwise block-buffered, and
 /// Glibc's `stdout` global isn't usable under strict concurrency.
-func relayLog(_ message: String) {
+public func relayLog(_ message: String) {
     try? FileHandle.standardOutput.write(contentsOf: Data((message + "\n").utf8))
 }
 
@@ -87,13 +87,43 @@ public struct LogPushSender: PushSender {
     }
 }
 
+/// Where the relay keeps its device registry and per-device pending queues.
+///
+/// Two implementations: ``RelayStore`` (a JSON file, for the single-process
+/// Docker relay) and `DynamoDBRelayStore` in `RelayAWS` (for Lambda, where
+/// many short-lived instances share state and none has a lasting disk).
+/// Every method may suspend, and every write may fail; a failure is thrown,
+/// never swallowed, so the caller can tell Stalwart the push was not taken.
+public protocol RelayStorage: Sendable {
+    /// Adds or replaces a device's registration.
+    func register(_ registration: DeviceRegistration) async throws
+    func registration(deviceId: String) async throws -> DeviceRegistration?
+    /// Appends to a device's queue, keeping at most
+    /// ``RelayLimits/maxPendingPerDevice`` of the newest entries.
+    func enqueue(deviceId: String, push: PendingPush) async throws
+    /// Returns and clears the device's queue, oldest first.
+    func drain(deviceId: String) async throws -> [PendingPush]
+    /// Removes a registration and its queue; false when there was none.
+    func unregister(deviceId: String) async throws -> Bool
+    /// Clears the APNs token, but only while it is still `token` — a device
+    /// that re-registered in the meantime keeps its new one.
+    func invalidateAPNsToken(deviceId: String, token: String) async throws
+    func isReady() async -> Bool
+}
+
+public enum RelayLimits {
+    public static let maxPendingPerDevice = 50
+    public static let maxWebhookBytes = 64 * 1024
+    public static let maxDeviceIdLength = 128
+}
+
 /// Device registry + per-device pending queues, persisted as JSON so the
 /// relay survives restarts. Single actor — relay state is tiny.
-public actor RelayStore {
+public actor RelayStore: RelayStorage {
     private var registrations: [String: DeviceRegistration] = [:]
     private var pending: [String: [PendingPush]] = [:]
     private let persistenceURL: URL?
-    private let maxQueue = 50
+    private let maxQueue = RelayLimits.maxPendingPerDevice
 
     private var persistenceError: String?
 

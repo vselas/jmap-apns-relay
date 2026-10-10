@@ -6,7 +6,16 @@ import NIOHTTP1
 
 /// APNs credentials and target host, read from the process environment.
 public struct APNsConfiguration: Sendable {
-    public var keyPath: String
+    /// Where the `.p8` signing key comes from.
+    public enum Key: Sendable, Equatable {
+        /// A file on disk (`APNS_KEY_PATH`), as the Docker relay mounts it.
+        case file(path: String)
+        /// The PEM text itself (`APNS_KEY`), as the Lambda relay reads it
+        /// from Parameter Store — a Lambda has no secrets volume to mount.
+        case pem(String)
+    }
+
+    public var key: Key
     public var keyId: String
     public var teamId: String
     public var topic: String
@@ -28,11 +37,15 @@ public struct APNsConfiguration: Sendable {
     }
 
     static func validated(environment: [String: String]) throws -> APNsConfiguration? {
-        let names = ["APNS_KEY_PATH", "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_TOPIC"]
-        let present = names.filter { environment[$0]?.isEmpty == false }
-        guard !present.isEmpty else { return nil }
-        guard present.count == names.count else { throw ConfigurationError.incompleteCredentials }
-        guard let keyPath = environment["APNS_KEY_PATH"],
+        func value(_ name: String) -> String? {
+            environment[name].flatMap { $0.isEmpty ? nil : $0 }
+        }
+        // The key may come as a path or as its contents; either one counts.
+        let key: Key? = value("APNS_KEY").map(Key.pem) ?? value("APNS_KEY_PATH").map { .file(path: $0) }
+        let present = [key != nil] + ["APNS_KEY_ID", "APNS_TEAM_ID", "APNS_TOPIC"].map { value($0) != nil }
+        guard present.contains(true) else { return nil }
+        guard !present.contains(false) else { throw ConfigurationError.incompleteCredentials }
+        guard let key,
             let keyId = environment["APNS_KEY_ID"],
             let teamId = environment["APNS_TEAM_ID"],
             let topic = environment["APNS_TOPIC"]
@@ -42,7 +55,7 @@ public struct APNsConfiguration: Sendable {
             throw ConfigurationError.invalidEnvironment(apnsEnvironment)
         }
         return APNsConfiguration(
-            keyPath: keyPath,
+            key: key,
             keyId: keyId,
             teamId: teamId,
             topic: topic,
@@ -57,8 +70,8 @@ public struct APNsConfiguration: Sendable {
         case invalidEnvironment(String)
     }
 
-    private init(keyPath: String, keyId: String, teamId: String, topic: String, host: String, alertTitle: String, alertBody: String) {
-        self.keyPath = keyPath
+    private init(key: Key, keyId: String, teamId: String, topic: String, host: String, alertTitle: String, alertBody: String) {
+        self.key = key
         self.keyId = keyId
         self.teamId = teamId
         self.topic = topic
@@ -83,7 +96,11 @@ public actor APNsSender: PushSender {
     public init(configuration: APNsConfiguration, httpClient: HTTPClient) throws {
         self.configuration = configuration
         self.httpClient = httpClient
-        let pem = try String(contentsOfFile: configuration.keyPath, encoding: .utf8)
+        let pem: String
+        switch configuration.key {
+        case .file(let path): pem = try String(contentsOfFile: path, encoding: .utf8)
+        case .pem(let text): pem = text
+        }
         self.privateKey = try P256.Signing.PrivateKey(pemRepresentation: pem)
     }
 

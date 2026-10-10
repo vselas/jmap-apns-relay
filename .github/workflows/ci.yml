@@ -21,4 +21,24 @@ jobs:
       - name: Test
         run: swift test
       - name: Protocol fixture
-        run: scripts/check-protocol-fixture.sh --self
+        # The swift image has no python3; the fixture check needs it.
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 >/dev/null
+          scripts/check-protocol-fixture.sh --self
+
+  lambda:
+    # The hosted relay: build the provided.al2023 bootstrap on a native ARM
+    # runner and drive the whole protocol through the Lambda runtime emulator
+    # against DynamoDB Local. No AWS account involved.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Lambda zip
+        run: scripts/build-lambda.sh
+      - name: Lambda integration
+        run: scripts/test-lambda-local.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-lambda-arm64
+          path: .build/lambda/relay-lambda.zip
+          retention-days: 14
