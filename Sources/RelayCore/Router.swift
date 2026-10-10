@@ -92,6 +92,7 @@ public func buildRouter<Context: RequestContext>(
     now: @escaping @Sendable () -> Date = { .now }
 ) -> Router<Context> {
     let router = Router(context: Context.self)
+    router.add(middleware: ErrorLoggingMiddleware())
 
     router.get("healthz") { _, _ in
         "ok"
@@ -291,6 +292,30 @@ public func buildRouter<Context: RequestContext>(
     }
 
     return router
+}
+
+/// Logs any error a handler throws, then answers 500 for one that is not
+/// already an HTTP response.
+///
+/// On Lambda this is the difference between a diagnosable failure and none:
+/// the Function URL adapter hands an escaped error straight to the Lambda
+/// runtime, which records a function error, logs nothing, and the caller
+/// (Stalwart) sees a bare 502.
+struct ErrorLoggingMiddleware<Context: RequestContext>: RouterMiddleware {
+    func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
+        do {
+            return try await next(request, context)
+        } catch let error as HTTPResponseError {
+            // 404 for an unknown device is routine; anything 5xx is not.
+            if error.status.code >= 500 {
+                relayLog("[push] \(request.method) \(request.uri.path) → \(error.status.code): \(error)")
+            }
+            throw error
+        } catch {
+            relayLog("[push] \(request.method) \(request.uri.path) failed: \(String(reflecting: error))")
+            return Response(status: .internalServerError)
+        }
+    }
 }
 
 private func refusal(_ status: HTTPResponse.Status, _ error: String, maxDevices: Int? = nil) -> Response {

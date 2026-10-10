@@ -187,6 +187,10 @@ it as a secret.
 
 ## Deploy to AWS Lambda
 
+**Full runbook: [`docs/deploy-aws.md`](docs/deploy-aws.md)** — production
+details, redeploys, APNs environments, secrets, quotas, monitoring, cost and
+troubleshooting.
+
 The same router runs as an ARM64 Lambda behind a
 [Function URL](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html),
 which supplies HTTPS with a publicly trusted certificate — nothing to configure,
@@ -241,7 +245,8 @@ poll, which comes within minutes — and a drain returns at most the newest 50.
 **Cost control.** The webhook is unauthenticated by design, so the function has
 a reserved concurrency (`RESERVED_CONCURRENCY`, default 20) that caps what a
 flood can cost; a request for an unknown device costs one DynamoDB read and
-returns 404. Logs are kept 14 days.
+returns 404. On a new account, whose whole quota is 10, the deploy skips the
+reservation and the quota is the ceiling. Logs are kept 14 days.
 
 **APNs environment.** One stack talks to one APNs host, and it must match the
 `aps-environment` the installed build was *signed* with; a mismatch answers

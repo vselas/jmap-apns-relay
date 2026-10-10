@@ -4,6 +4,7 @@ import AWSLambdaEvents
 import HummingbirdLambda
 import RelayAWS
 import RelayAppStore
+import RelayLambdaSupport
 import RelayCore
 
 /// The relay as an AWS Lambda behind a Function URL.
@@ -13,7 +14,9 @@ import RelayCore
 /// mounted volume) and TLS (the Function URL's instead of our own) differ.
 /// Everything below runs once per cold start and is reused by every request
 /// the instance serves afterwards — the APNs JWT cache included.
-typealias LambdaContext = BasicLambdaRequestContext<FunctionURLRequest>
+// Not the stock `FunctionURLRequest`: that one cannot decode a request
+// without a User-Agent, which is every request Stalwart sends.
+typealias LambdaContext = BasicLambdaRequestContext<TolerantFunctionURLRequest>
 
 let httpClient = HTTPClient(eventLoopGroupProvider: .singleton)
 let processEnvironment = ProcessInfo.processInfo.environment
@@ -51,5 +54,7 @@ let router = buildRouter(
     authToken: runtime.authToken, entitlements: entitlements
 )
 relayLog("[push] Lambda relay ready (mode \(runtime.mode.rawValue), table \(table))")
-let lambda = FunctionURLLambdaFunction(router: router)
+let lambda = LambdaFunction(
+    router: router, event: TolerantFunctionURLRequest.self, output: FunctionURLResponse.self
+)
 try await lambda.runService()

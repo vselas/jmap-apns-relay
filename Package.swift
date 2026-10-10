@@ -21,6 +21,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-asn1.git", from: "1.1.0"),
         .package(url: "https://github.com/soto-project/soto-core.git", from: "7.17.0"),
         .package(url: "https://github.com/awslabs/swift-aws-lambda-events.git", from: "1.4.0"),
+        .package(url: "https://github.com/awslabs/swift-aws-lambda-runtime.git", from: "2.4.1"),
     ],
     targets: [
         // Protocol, storage contract, router and APNs: everything both
@@ -63,6 +64,16 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
+        // Lambda event handling the stock types get wrong (see
+        // TolerantFunctionURLRequest).
+        .target(
+            name: "RelayLambdaSupport",
+            dependencies: [
+                .product(name: "HummingbirdLambda", package: "hummingbird-lambda"),
+                .product(name: "AWSLambdaRuntime", package: "swift-aws-lambda-runtime"),
+                .product(name: "AWSLambdaEvents", package: "swift-aws-lambda-events"),
+            ]
+        ),
         // The hosted relay: an AWS Lambda behind a Function URL.
         .executableTarget(
             name: "PushRelayLambda",
@@ -70,6 +81,7 @@ let package = Package(
                 "RelayCore",
                 "RelayAWS",
                 "RelayAppStore",
+                "RelayLambdaSupport",
                 .product(name: "HummingbirdLambda", package: "hummingbird-lambda"),
                 .product(name: "AWSLambdaEvents", package: "swift-aws-lambda-events"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
@@ -81,6 +93,8 @@ let package = Package(
                 "RelayCore",
                 "RelayAWS",
                 "RelayAppStore",
+                "RelayLambdaSupport",
+                .product(name: "AWSLambdaRuntime", package: "swift-aws-lambda-runtime"),
                 .product(name: "AppStoreServerLibrary", package: "app-store-server-library-swift"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftASN1", package: "swift-asn1"),

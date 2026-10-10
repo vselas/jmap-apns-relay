@@ -4,7 +4,7 @@ Run by scripts/test-lambda-local.sh."""
 import base64, json, sys, urllib.request
 import os
 URL = os.environ.get("RELAY_INVOKE_URL", "http://localhost:9001/2015-03-31/functions/function/invocations")
-def invoke(method, path, headers=None, body=None):
+def invoke(method, path, headers=None, body=None, user_agent="it"):
     headers = dict(headers or {})
     event = {
         "version": "2.0", "routeKey": "$default", "rawPath": path, "rawQueryString": "",
@@ -12,7 +12,7 @@ def invoke(method, path, headers=None, body=None):
         "requestContext": {"accountId": "anonymous", "apiId": "relay", "domainName": "relay.lambda-url.eu-central-1.on.aws",
             "domainPrefix": "relay", "requestId": "r", "routeKey": "$default", "stage": "$default",
             "time": "10/Oct/2026:12:00:00 +0000", "timeEpoch": 1791000000000,
-            "http": {"method": method, "path": path, "protocol": "HTTP/1.1", "sourceIp": "1.2.3.4", "userAgent": "it"}},
+            "http": {"method": method, "path": path, "protocol": "HTTP/1.1", "sourceIp": "1.2.3.4", "userAgent": user_agent}},
         "isBase64Encoded": body is not None,
     }
     if body is not None:
@@ -40,7 +40,9 @@ def main():
     verification = b'{"@type":"PushVerification","pushSubscriptionId":"ps1","verificationCode":"code-123"}'
     s, d = invoke("POST", "/v1/push/dev-it", body=verification); check("verification webhook", s == 200, f"{s} {d!r}")
     cipher = bytes([0x00, 0xFF, 0xFE, 0x80, 0x41, 0x04, 0xC3, 0x28, 0x7B, 0x00]) * 20
-    s, d = invoke("POST", "/v1/push/dev-it", {"content-encoding": "aes128gcm"}, cipher); check("encrypted webhook", s == 200, f"{s} {d!r}")
+    # Stalwart sends no User-Agent, so Lambda puts null there. The stock
+    # event type could not decode that and every Stalwart push was a 502.
+    s, d = invoke("POST", "/v1/push/dev-it", {"content-encoding": "aes128gcm"}, cipher, user_agent=None); check("encrypted webhook without a User-Agent (Stalwart)", s == 200, f"{s} {d!r}")
     s, _ = invoke("GET", "/v1/pending/dev-it"); check("poll without token is 401", s == 401, s)
     s, d = invoke("GET", "/v1/pending/dev-it", auth)
     items = json.loads(d) if s == 200 else []
