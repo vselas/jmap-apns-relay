@@ -26,7 +26,9 @@ push addressed to the right device.
 Written in Swift with [Hummingbird](https://github.com/hummingbird-project/hummingbird);
 ES256 provider tokens via [swift-crypto](https://github.com/apple/swift-crypto),
 HTTP/2 to Apple via [async-http-client](https://github.com/swift-server/async-http-client).
-No database — device registrations and the small pending queue persist to a JSON file.
+Two deployments from one codebase: a **container** that keeps device registrations
+and the small pending queue in a JSON file, and an **AWS Lambda** that keeps them
+in DynamoDB (see [Deploy to AWS Lambda](#deploy-to-aws-lambda)).
 
 ## Quick start (Docker)
 
@@ -183,6 +185,122 @@ checkout to additionally require both repositories' copies to match.
 **Never commit the `.p8`** — it can send push to every user of your app. Mount
 it as a secret.
 
+## Deploy to AWS Lambda
+
+**Full runbook: [`docs/deploy-aws.md`](docs/deploy-aws.md)** — production
+details, redeploys, APNs environments, secrets, quotas, monitoring, cost and
+troubleshooting.
+
+The same router runs as an ARM64 Lambda behind a
+[Function URL](https://docs.aws.amazon.com/lambda/latest/dg/urls-configuration.html),
+which supplies HTTPS with a publicly trusted certificate — nothing to configure,
+and every JMAP server trusts it. State moves to an on-demand DynamoDB table,
+secrets to Parameter Store. At small scale this stays inside AWS's free tiers.
+
+```
+JMAP server ──▶ Function URL (HTTPS) ──▶ Lambda (provided.al2023, arm64) ──▶ APNs
+                                              │
+                          DynamoDB (pk/sk, TTL) · SSM SecureString ×2
+```
+
+Everything is in [`deploy/aws/template.yaml`](deploy/aws/template.yaml) (one
+CloudFormation stack) and two scripts:
+
+```bash
+export AWS_PROFILE=relay AWS_REGION=eu-central-1
+
+scripts/build-lambda.sh                 # Docker → .build/lambda/relay-lambda.zip
+scripts/test-lambda-local.sh            # optional: the zip in the Lambda emulator vs DynamoDB Local
+
+# First deploy stores both secrets; later deploys can omit them.
+APNS_KEY_FILE=~/keys/AuthKey_ABCDE12345.p8 \
+APNS_KEY_ID=ABCDE12345 APNS_TEAM_ID=UA5PQ9SVT8 APNS_TOPIC=com.example.app \
+RELAY_AUTH_TOKEN="$(openssl rand -base64 48)" \
+  scripts/deploy-lambda.sh
+```
+
+The script prints the relay URL (`https://<id>.lambda-url.<region>.on.aws/`);
+clients use it for both the app-facing and the server-facing relay address. Keep
+the auth token: clients need it to register.
+
+What differs from the container:
+
+| | Container | Lambda |
+|---|---|---|
+| State | `STATE_PATH` JSON file | `DYNAMODB_TABLE` |
+| `.p8` key | `APNS_KEY_PATH` (mounted file) | `APNS_KEY_PARAMETER` → `APNS_KEY` (PEM text) |
+| Auth token | `RELAY_AUTH_TOKEN` | `RELAY_AUTH_TOKEN_PARAMETER` → `RELAY_AUTH_TOKEN` |
+| TLS | `TLS_CERT` / `TLS_KEY` | the Function URL's |
+
+Any `<NAME>_PARAMETER` variable is resolved from Parameter Store (decrypted) at
+cold start into `<NAME>`; a plain `<NAME>` wins, which keeps local runs AWS-free.
+A missing parameter stops the cold start rather than starting an open relay.
+
+**Table layout.** One item per registration (`pk = device#<id>`,
+`sk = registration`) and one item per queued push (`sk = push#<time>#<nonce>`),
+so concurrent instances never overwrite each other's queue. Queued pushes carry
+an `expiresAt` TTL of one day — the queue exists for the client's verification
+poll, which comes within minutes — and a drain returns at most the newest 50.
+
+**Cost control.** The webhook is unauthenticated by design, so the function has
+a reserved concurrency (`RESERVED_CONCURRENCY`, default 20) that caps what a
+flood can cost; a request for an unknown device costs one DynamoDB read and
+returns 404. On a new account, whose whole quota is 10, the deploy skips the
+reservation and the quota is the ceiling. Logs are kept 14 days.
+
+**APNs environment.** One stack talks to one APNs host, and it must match the
+`aps-environment` the installed build was *signed* with; a mismatch answers
+`BadDeviceToken`. Run a second stack (`STAGE=sandbox APNS_ENVIRONMENT=sandbox`)
+when both kinds of build need push at once.
+
+## Selling push: App Store subscriptions
+
+A relay can require an active App Store subscription before it delivers to
+APNs. Set `APPSTORE_PRODUCT_IDS` and it does; leave it unset and nothing changes.
+
+| Variable | Meaning |
+|---|---|
+| `APPSTORE_PRODUCT_IDS` | Comma-separated product ids that grant push. Turns the feature on. |
+| `APPSTORE_BUNDLE_ID` | Defaults to `APNS_TOPIC`. |
+| `APPSTORE_APP_APPLE_ID` | The app's numeric App Store id; required for `Production`. |
+| `APPSTORE_ENVIRONMENT` | `Production` (default; App Store and TestFlight) or `Sandbox`. `Xcode` and `LocalTesting` are refused: Apple's library skips signature checks for them. |
+| `APPSTORE_MAX_DEVICES` | Registrations one subscription may hold (default 10; each account on each device is one). |
+
+**How a client proves it paid.** `POST /v1/register` gains an optional
+`signedTransaction`: the StoreKit 2 `Transaction.jwsRepresentation` for the
+subscription. The relay verifies it with Apple's
+[App Store Server Library](https://github.com/apple/app-store-server-library-swift):
+the ES256 signature, the `x5c` chain to **Apple Root CA - G3** (embedded and
+fingerprint-checked), Apple's receipt-signing OIDs, online revocation, bundle id,
+environment and product. It then records the subscription under its
+`originalTransactionId` and links the device to it. Later registrations from
+the same device (a new APNs token, every launch) need no proof.
+
+Refusals carry a JSON `error` the app can act on:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 402 | `entitlementRequired` | No proof, and none on file for this device. |
+| 402 | `entitlementInvalid` | Not signed by Apple, or not for this app or product. |
+| 402 | `entitlementExpired` | Genuine, but the period has ended or it was refunded. |
+| 403 | `deviceLimitReached` | The subscription already holds `maxDevices` registrations. |
+| 503 | `entitlementUnavailable` | Apple's revocation check did not answer; retry. |
+
+The shared `RELAY_AUTH_TOKEN` is still required on top: the subscription is what
+pays, the token keeps scripted clients away from registration.
+
+**What stays free.** The webhook still queues every message, so the JMAP
+subscription's verification code reaches `/v1/pending` before anyone pays. Only
+the APNs leg is gated: an unpaid device's webhooks answer 200 and send nothing.
+
+**Keeping current.** Point App Store Connect's *App Store Server Notifications*
+(Version 2) at `https://<relay>/v1/appstore/notifications`; the deploy script
+prints the URL. Renewals, billing-grace periods, expiries, refunds and refund
+reversals then update the subscription without the app. Each notification is
+verified like a transaction, and an older one arriving after a newer one is
+ignored. Pushes keep flowing for an hour past a period's end, so a renewal
+racing its notification never drops one.
+
 ## Build & test from source
 
 ```bash
@@ -190,9 +308,12 @@ swift build
 swift test
 swift build -c release
 scripts/check-protocol-fixture.sh --self
+scripts/build-lambda.sh && scripts/test-lambda-local.sh   # Lambda, needs Docker
+PAID=1 scripts/test-lambda-local.sh                       # …with entitlements on
+scripts/test-dynamodb-local.sh                            # DynamoDB store vs DynamoDB Local
 ```
 
-Requires Swift 6.2+. The Docker image is built from the [`Dockerfile`](Dockerfile)
+Requires Swift 6.2+ (the Lambda zip builds in the `swift:6.3.3-amazonlinux2023` image). The Docker image is built from the [`Dockerfile`](Dockerfile)
 at the repo root. The example Compose file pins release `0.3.0`; use `:edge`
 deliberately when testing unreleased `main` behavior.
 

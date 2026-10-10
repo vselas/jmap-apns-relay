@@ -3,7 +3,7 @@ import Hummingbird
 import HummingbirdTesting
 import Testing
 
-@testable import PushRelay
+@testable import RelayCore
 
 @Suite struct RelayTests {
     func makeApp(authToken: String? = nil) throws -> Application<RouterResponder<BasicRequestContext>> {

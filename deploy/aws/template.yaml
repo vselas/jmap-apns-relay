@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  jmap-apns-relay as an AWS Lambda behind a Function URL: one ARM64 function,
+  one on-demand DynamoDB table, two SecureString parameters (created outside
+  this stack, so no secret ever passes through CloudFormation).
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedPattern: "[a-z0-9-]+"
+    Description: Suffix for resource names and the parameter path.
+  CodeBucket:
+    Type: String
+    Description: S3 bucket holding the Lambda zip (scripts/deploy-lambda.sh creates it).
+  CodeKey:
+    Type: String
+    Description: S3 key of the Lambda zip; a new key per build makes CloudFormation redeploy.
+  APNsKeyId:
+    Type: String
+    AllowedPattern: "[A-Z0-9]{10}"
+  APNsTeamId:
+    Type: String
+    AllowedPattern: "[A-Z0-9]{10}"
+  APNsTopic:
+    Type: String
+    Description: The app's bundle id.
+  APNsEnvironment:
+    Type: String
+    Default: production
+    AllowedValues: [production, sandbox]
+    Description: Must match the aps-environment the installed build is signed with.
+  ReservedConcurrency:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    Description: >
+      Hard ceiling on simultaneous instances. The webhook is unauthenticated by
+      design, so this bounds what a flood of junk requests can cost. 0 means
+      no reservation: needed on a new account, whose whole Lambda quota is 10
+      and may not be reserved; the account quota is then the ceiling.
+  AppStoreProductIds:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated product ids that grant push. Empty means the relay does
+      not sell push and every registration with the auth token is served.
+  AppStoreAppAppleId:
+    Type: String
+    Default: ""
+    AllowedPattern: "[0-9]*"
+    Description: The app's numeric App Store id (required when selling push in Production).
+  AppStoreEnvironment:
+    Type: String
+    Default: Production
+    AllowedValues: [Production, Sandbox]
+    Description: Production accepts App Store and TestFlight purchases; Sandbox, sandbox-account ones.
+  MaxDevicesPerSubscription:
+    Type: Number
+    Default: 10
+    MinValue: 1
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  ReserveConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub jmap-apns-relay-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: entitlementId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      # Sparse: only paid registrations carry entitlementId. Counting a
+      # subscription's devices is one Query on it.
+      GlobalSecondaryIndexes:
+        - IndexName: byEntitlement
+          KeySchema:
+            - { AttributeName: entitlementId, KeyType: HASH }
+            - { AttributeName: pk, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/jmap-apns-relay-${Stage}
+      RetentionInDays: !Ref LogRetentionDays
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: relay
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt Table.Arn
+                  - !Sub ${Table.Arn}/index/byEntitlement
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/jmap-apns-relay/${Stage}/*
+              # SecureStrings under the AWS-managed key (alias/aws/ssm) decrypt
+              # through SSM with no extra KMS grant.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${LogGroup.Arn}:*
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub jmap-apns-relay-${Stage}
+      Description: JMAP PushSubscription webhooks to APNs
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      MemorySize: 256
+      Timeout: 15
+      ReservedConcurrentExecutions: !If [ReserveConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      Role: !GetAtt Role.Arn
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: !Ref CodeKey
+      LoggingConfig:
+        LogGroup: !Ref LogGroup
+      Environment:
+        Variables:
+          RELAY_MODE: production
+          DYNAMODB_TABLE: !Ref Table
+          RELAY_AUTH_TOKEN_PARAMETER: !Sub /jmap-apns-relay/${Stage}/auth-token
+          APNS_KEY_PARAMETER: !Sub /jmap-apns-relay/${Stage}/apns-key
+          APNS_KEY_ID: !Ref APNsKeyId
+          APNS_TEAM_ID: !Ref APNsTeamId
+          APNS_TOPIC: !Ref APNsTopic
+          APNS_ENVIRONMENT: !Ref APNsEnvironment
+          APPSTORE_PRODUCT_IDS: !Ref AppStoreProductIds
+          APPSTORE_APP_APPLE_ID: !Ref AppStoreAppAppleId
+          APPSTORE_ENVIRONMENT: !Ref AppStoreEnvironment
+          APPSTORE_MAX_DEVICES: !Ref MaxDevicesPerSubscription
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref Function
+      # The relay authenticates registration itself (bearer token), and the
+      # webhook must stay reachable by any JMAP server, so the URL is public.
+      AuthType: NONE
+
+  # Public Function URLs need both grants since October 2025.
+  FunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  FunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  AppStoreNotificationURL:
+    Description: Paste into App Store Connect → App Information → App Store Server Notifications (Version 2).
+    Value: !Sub "${FunctionUrl.FunctionUrl}v1/appstore/notifications"
+  RelayURL:
+    Description: Set this as the relay URL (both fields) in the app's push settings.
+    Value: !GetAtt FunctionUrl.FunctionUrl
+  TableName:
+    Value: !Ref Table
+  FunctionName:
+    Value: !Ref Function

@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+# Builds the Lambda bootstrap for provided.al2023 (ARM64 by default). Used by
+# scripts/build-lambda.sh; the result is a zip, not an image.
+#
+#   docker build --platform linux/arm64 -f Dockerfile.lambda --output .build/lambda .
+FROM swift:6.3.3-amazonlinux2023 AS build
+WORKDIR /build
+COPY Package.swift Package.resolved ./
+RUN swift package resolve
+COPY Sources ./Sources
+COPY Tests ./Tests
+# Static stdlib so the zip carries everything provided.al2023 lacks; Foundation
+# is linked statically too, which is what --static-swift-stdlib does on Linux.
+RUN swift build -c release --product PushRelayLambda --static-swift-stdlib \
+    && mkdir -p /out \
+    && cp .build/release/PushRelayLambda /out/bootstrap \
+    && strip /out/bootstrap
+
+FROM scratch
+COPY --from=build /out/bootstrap /bootstrap

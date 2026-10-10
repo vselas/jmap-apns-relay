@@ -1,3 +1,4 @@
+import AsyncHTTPClient
 import Crypto
 import Foundation
 import Hummingbird
@@ -5,7 +6,7 @@ import HummingbirdTesting
 import NIOCore
 import Testing
 
-@testable import PushRelay
+@testable import RelayCore
 
 @Suite struct APNsSenderTests {
     @Test func onlyStateChangeIsDelivered() {
@@ -104,6 +105,31 @@ import Testing
         let sigBytes = try #require(Self.base64URLDecode(parts[2]))
         let signature = try P256.Signing.ECDSASignature(rawRepresentation: sigBytes)
         #expect(key.publicKey.isValidSignature(signature, for: signingInput))
+    }
+
+    /// The Lambda has no file to mount, so the key arrives as PEM text;
+    /// either spelling must load the same key, and naming both picks the text.
+    @Test func theKeyLoadsFromTextOrFile() throws {
+        let key = P256.Signing.PrivateKey()
+        let file = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString).p8")
+        try Data(key.pemRepresentation.utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let common = ["APNS_KEY_ID": "KEY1234567", "APNS_TEAM_ID": "TEAM123456", "APNS_TOPIC": "com.example.app"]
+
+        let fromText = try #require(try APNsConfiguration.validated(environment: common.merging(["APNS_KEY": key.pemRepresentation]) { $1 }))
+        #expect(fromText.key == .pem(key.pemRepresentation))
+        let fromFile = try #require(try APNsConfiguration.validated(environment: common.merging(["APNS_KEY_PATH": file.path]) { $1 }))
+        #expect(fromFile.key == .file(path: file.path))
+        let both = try #require(try APNsConfiguration.validated(environment: common.merging(["APNS_KEY": key.pemRepresentation, "APNS_KEY_PATH": file.path]) { $1 }))
+        #expect(both.key == .pem(key.pemRepresentation))
+
+        let client = HTTPClient.shared
+        _ = try APNsSender(configuration: fromText, httpClient: client)
+        _ = try APNsSender(configuration: fromFile, httpClient: client)
+        // A key id without any key is incomplete, not "APNs off".
+        #expect(throws: APNsConfiguration.ConfigurationError.incompleteCredentials) {
+            _ = try APNsConfiguration.validated(environment: common)
+        }
     }
 
     @Test func webhookInvokesSenderWithRegisteredToken() async throws {
