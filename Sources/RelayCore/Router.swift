@@ -138,7 +138,8 @@ public func buildRouter<Context: RequestContext>(
             throw HTTPError(.badRequest)
         }
         guard let entitlements else {
-            try await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken))
+            let stored = try await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken))
+            logRegistration(sent: body.apnsToken, stored: stored)
             return Response(status: .noContent)
         }
         let existing = try await store.registration(deviceId: body.deviceId)
@@ -173,13 +174,14 @@ public func buildRouter<Context: RequestContext>(
             relayLog("[push] \(entitlement.originalTransactionId) is at its device limit")
             return refusal(.forbidden, "deviceLimitReached", maxDevices: entitlements.maxDevicesPerEntitlement)
         }
-        try await store.register(
+        let stored = try await store.register(
             DeviceRegistration(
                 deviceId: body.deviceId,
                 apnsToken: body.apnsToken,
                 entitlementId: entitlement.originalTransactionId
             )
         )
+        logRegistration(sent: body.apnsToken, stored: stored)
         return Response(status: .noContent)
     }
 
@@ -317,6 +319,26 @@ struct ErrorLoggingMiddleware<Context: RequestContext>: RouterMiddleware {
         }
     }
 }
+
+/// One line per registration, saying what the device sent and what the relay
+/// now holds. A registration used to leave no trace at all, so a device whose
+/// token had gone missing could only be found by its skipped pushes.
+func logRegistration(sent: String?, stored: DeviceRegistration) {
+    relayLog("[push] registered \(stored.deviceId): \(registrationSummary(sent: sent, stored: stored.apnsToken))")
+}
+
+/// `token …a1b2c3 sent`, `no token sent, kept …a1b2c3`, or
+/// `no token sent, none stored`. Only the last six characters of a token are
+/// logged: enough to tell one from its replacement, not enough to address it.
+func registrationSummary(sent: String?, stored: String?) -> String {
+    switch (sent, stored) {
+    case (.some(let token), _): "token \(tokenSuffix(token)) sent"
+    case (nil, .some(let token)): "no token sent, kept \(tokenSuffix(token))"
+    case (nil, nil): "no token sent, none stored"
+    }
+}
+
+func tokenSuffix(_ token: String) -> String { "…" + token.suffix(6) }
 
 private func refusal(_ status: HTTPResponse.Status, _ error: String, maxDevices: Int? = nil) -> Response {
     let body = (try? JSONEncoder().encode(RegistrationRefusal(error: error, maxDevices: maxDevices))) ?? Data()

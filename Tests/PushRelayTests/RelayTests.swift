@@ -150,6 +150,33 @@ import Testing
         #expect(await store.registration(deviceId: "dev1")?.apnsToken == nil)
     }
 
+    /// The launch race, end to end: the app registers before iOS has issued
+    /// a token and again once it has, and the tokenless request may land
+    /// second. The token has to survive it.
+    @Test func aRegistrationWithoutATokenKeepsTheStoredOne() async throws {
+        let store = try RelayStore(persistenceURL: nil)
+        let app = Application(router: buildRouter(store: store, sender: LogPushSender()))
+        try await app.test(.router) { client in
+            for body in [#"{"deviceId":"dev1","apnsToken":"tok"}"#, #"{"deviceId":"dev1"}"#] {
+                let response = try await client.execute(
+                    uri: "/v1/register", method: .post, body: ByteBuffer(string: body)
+                )
+                #expect(response.status == .noContent)
+            }
+        }
+        #expect(await store.registration(deviceId: "dev1")?.apnsToken == "tok")
+
+        // A new token still replaces the old one.
+        try await store.register(DeviceRegistration(deviceId: "dev1", apnsToken: "tok2"))
+        #expect(await store.registration(deviceId: "dev1")?.apnsToken == "tok2")
+    }
+
+    @Test func registrationLogLinesSayWhatHappenedToTheToken() {
+        #expect(registrationSummary(sent: "0123456789abcdef", stored: "0123456789abcdef") == "token …abcdef sent")
+        #expect(registrationSummary(sent: nil, stored: "0123456789abcdef") == "no token sent, kept …abcdef")
+        #expect(registrationSummary(sent: nil, stored: nil) == "no token sent, none stored")
+    }
+
     @Test func legacySnapshotMigratesAndParentDirectoryIsCreated() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

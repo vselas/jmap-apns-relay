@@ -20,10 +20,55 @@ import Testing
         try await store.register(first)
         #expect(try await store.registration(deviceId: "d1") == first)
 
-        // The APNs token arrives later; re-registering replaces the item.
+        // The APNs token arrives later and is added to the registration.
         let second = DeviceRegistration(deviceId: "d1", apnsToken: "tok", registeredAt: Date(timeIntervalSince1970: 1_700_000_100))
-        try await store.register(second)
+        #expect(try await store.register(second) == second)
         #expect(try await store.registration(deviceId: "d1") == second)
+
+        // A new token replaces the old one.
+        let renewed = DeviceRegistration(deviceId: "d1", apnsToken: "tok2", registeredAt: Date(timeIntervalSince1970: 1_700_000_200))
+        try await store.register(renewed)
+        #expect(try await store.registration(deviceId: "d1") == renewed)
+    }
+
+    /// The launch race that silenced a phone for a day: the app's tokenless
+    /// registration landed after the one carrying the token, and erased it.
+    @Test func aRegistrationWithoutATokenKeepsTheStoredOne() async throws {
+        let db = FakeDynamoDB()
+        let store = makeStore(db)
+        try await store.register(DeviceRegistration(deviceId: "d1", apnsToken: "tok"))
+
+        let later = Date(timeIntervalSince1970: 1_700_000_300)
+        let stored = try await store.register(DeviceRegistration(deviceId: "d1", registeredAt: later))
+        #expect(stored.apnsToken == "tok")
+        #expect(stored.registeredAt == later)
+        #expect(try await store.registration(deviceId: "d1")?.apnsToken == "tok")
+        // One item, updated in place: no second registration row.
+        #expect(await db.itemCount == 1)
+    }
+
+    /// Either order of the two launch registrations ends with the token.
+    @Test func concurrentRegistrationsNeverLoseTheToken() async throws {
+        for _ in 0..<20 {
+            let db = FakeDynamoDB()
+            let store = makeStore(db)
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { _ = try? await store.register(DeviceRegistration(deviceId: "d1")) }
+                group.addTask { _ = try? await store.register(DeviceRegistration(deviceId: "d1", apnsToken: "tok")) }
+            }
+            #expect(try await store.registration(deviceId: "d1")?.apnsToken == "tok")
+        }
+    }
+
+    /// The token is kept; the entitlement is not. A device re-registered
+    /// without one has left its subscription.
+    @Test func aRegistrationWithoutAnEntitlementDropsTheStoredOne() async throws {
+        let db = FakeDynamoDB()
+        let store = makeStore(db)
+        try await store.register(DeviceRegistration(deviceId: "d1", apnsToken: "tok", entitlementId: "sub1"))
+        let stored = try await store.register(DeviceRegistration(deviceId: "d1"))
+        #expect(stored.entitlementId == nil)
+        #expect(stored.apnsToken == "tok")
     }
 
     /// The point of encrypted push: bytes that are not text survive storage.

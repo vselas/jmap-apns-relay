@@ -90,7 +90,7 @@ configuration is rejected in every mode.
 
 | Method | Path                    | Purpose                                             |
 |--------|-------------------------|-----------------------------------------------------|
-| `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional). Requires the bearer token. |
+| `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional; a registration without one keeps the token already stored). Requires the bearer token. |
 | `DELETE` | `/v1/register/:deviceId` | Unregister a device and discard its pending queue. Requires the current bearer token. |
 | `POST` | `/v1/push/:deviceId`    | The JMAP `PushSubscription` webhook target. Unauthenticated — the server sends what it sends; the unguessable device id is the capability. |
 | `GET`  | `/v1/pending/:deviceId` | Dev poll — returns and clears the device's queue. Requires the bearer token. |

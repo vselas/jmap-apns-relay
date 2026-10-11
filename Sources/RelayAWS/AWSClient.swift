@@ -2,6 +2,7 @@ import AsyncHTTPClient
 import Foundation
 import NIOCore
 import NIOHTTP1
+import RelayCore
 import SotoSignerV4
 
 /// Credentials from the Lambda execution role, which the runtime hands every
@@ -101,8 +102,14 @@ public struct SignedAWSTransport: AWSJSONTransport {
         request.method = .POST
         request.headers = signed
         request.body = .bytes(ByteBuffer(bytes: payload))
-        let response = try await httpClient.execute(request, timeout: timeout)
-        let collected = try await response.body.collect(upTo: 4 * 1024 * 1024)
+        let prepared = request
+        // Retried once on a dead pooled connection: the first call after a
+        // frozen Lambda instance thaws often goes out on one. Every call the
+        // relay makes is safe to repeat (see `retryingStaleConnection`).
+        let (response, collected) = try await retryingStaleConnection(target) { [httpClient, timeout] in
+            let response = try await httpClient.execute(prepared, timeout: timeout)
+            return (response, try await response.body.collect(upTo: 4 * 1024 * 1024))
+        }
         let data = Data(buffer: collected)
         let object = (data.isEmpty ? [:] : try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
         guard (200..<300).contains(Int(response.status.code)) else {

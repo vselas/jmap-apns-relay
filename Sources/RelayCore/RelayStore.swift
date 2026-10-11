@@ -101,8 +101,17 @@ public struct LogPushSender: PushSender {
 /// Every method may suspend, and every write may fail; a failure is thrown,
 /// never swallowed, so the caller can tell Stalwart the push was not taken.
 public protocol RelayStorage: Sendable {
-    /// Adds or replaces a device's registration.
-    func register(_ registration: DeviceRegistration) async throws
+    /// Adds or updates a device's registration and returns what is now stored.
+    ///
+    /// A registration that carries no APNs token keeps the one already stored.
+    /// The app registers at launch before iOS has issued it a token, then again
+    /// once the token arrives, and the two requests race: when the tokenless
+    /// one landed last it erased the token, and every push after that was
+    /// skipped until the next launch happened to win. Only
+    /// ``invalidateAPNsToken(deviceId:token:)`` clears a token. The entitlement
+    /// is still replaced, so a device can move off a subscription.
+    @discardableResult
+    func register(_ registration: DeviceRegistration) async throws -> DeviceRegistration
     func registration(deviceId: String) async throws -> DeviceRegistration?
     /// Appends to a device's queue, keeping at most
     /// ``RelayLimits/maxPendingPerDevice`` of the newest entries.
@@ -190,15 +199,19 @@ public actor RelayStore: RelayStorage {
         case unsupportedSnapshotVersion(Int)
     }
 
-    public func register(_ registration: DeviceRegistration) throws {
+    @discardableResult
+    public func register(_ registration: DeviceRegistration) throws -> DeviceRegistration {
         let previous = registrations[registration.deviceId]
-        registrations[registration.deviceId] = registration
+        var stored = registration
+        stored.apnsToken = registration.apnsToken ?? previous?.apnsToken
+        registrations[registration.deviceId] = stored
         do {
             try persist()
         } catch {
             registrations[registration.deviceId] = previous
             throw error
         }
+        return stored
     }
 
     public func registration(deviceId: String) -> DeviceRegistration? {

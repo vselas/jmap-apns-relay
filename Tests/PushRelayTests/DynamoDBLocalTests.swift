@@ -76,6 +76,17 @@ struct DynamoDBLocalTests {
         #expect(try await store.registration(deviceId: "\(run)-a")?.entitlementId == id)
     }
 
+    /// Against the real UpdateItem: the tokenless registration from the app's
+    /// launch race must not erase the token the other one stored.
+    @Test func aRegistrationWithoutATokenKeepsTheStoredOne() async throws {
+        let store = try makeStore()
+        let device = "\(run)-keeps-token"
+        try await store.register(DeviceRegistration(deviceId: device, apnsToken: "tok"))
+        let stored = try await store.register(DeviceRegistration(deviceId: device))
+        #expect(stored.apnsToken == "tok")
+        #expect(try await store.registration(deviceId: device)?.apnsToken == "tok")
+    }
+
     /// The entitlement must not carry the table's TTL attribute, or DynamoDB
     /// would delete it when the period ended — and a renewal would find
     /// nothing to extend.
