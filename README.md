@@ -75,6 +75,7 @@ All configuration is via environment variables.
 | `STATE_PATH`       |          | `/tmp/pushrelay-state.json` | Device registry + pending queue (JSON)                         |
 | `RELAY_MODE`       |          | `development`               | `development` or fail-closed `production`                     |
 | `RELAY_AUTH_TOKEN` | ✓ prod   | —                           | Bearer token for register, unregister, and pending endpoints   |
+| `PENDING_WINDOW_SECONDS` |    | `900` prod, unlimited dev   | Keep a push for `/v1/pending` only if it arrives this long after the device's latest registration; `0` keeps every push |
 | `APNS_KEY_PATH`    | ✓ prod\* | —                           | Path to the APNs `.p8` auth key                                |
 | `APNS_KEY_ID`      |    ✓\*   | —                           | The key's 10-char Key ID                                       |
 | `APNS_TEAM_ID`     |    ✓\*   | —                           | Apple Developer Team ID                                        |
@@ -93,7 +94,7 @@ configuration is rejected in every mode.
 | `POST` | `/v1/register`          | Register a device — body `{"deviceId": "...", "apnsToken": "..."}` (`apnsToken` optional; a registration without one keeps the token already stored). Requires the bearer token. |
 | `DELETE` | `/v1/register/:deviceId` | Unregister a device and discard its pending queue. Requires the current bearer token. |
 | `POST` | `/v1/push/:deviceId`    | The JMAP `PushSubscription` webhook target. Unauthenticated — the server sends what it sends; the unguessable device id is the capability. |
-| `GET`  | `/v1/pending/:deviceId` | Dev poll — returns and clears the device's queue. Requires the bearer token. |
+| `GET`  | `/v1/pending/:deviceId` | Returns and clears the device's queue, for the verification poll (and, in development, as the delivery channel). Requires the bearer token. |
 | `GET`  | `/v1/capabilities`      | Public protocol, feature, and limit discovery                    |
 | `GET`  | `/healthz`              | Liveness                                            |
 | `GET`  | `/readyz`               | Readiness; fails after a state persistence error    |
@@ -155,6 +156,12 @@ noise, which an encrypting client discards as undecryptable.
 4. From then on the server POSTs a `StateChange` on every change; the relay
    delivers it to the device as an alert push.
 
+In production the queue only takes pushes arriving within `PENDING_WINDOW_SECONDS`
+(15 minutes) of the device's latest registration, so register immediately
+before creating the subscription; registering again reopens the window. Later
+pushes still go to APNs, they just are not kept as well. A development relay,
+where the poll is the only way a push arrives, keeps every push.
+
 Plaintext `PushVerification` payloads stay in the pending queue and are not sent
 to APNs. An encrypted verification is indistinguishable from an encrypted
 `StateChange`, so it is forwarded and can produce one generic setup alert; the
@@ -165,7 +172,8 @@ to decrypt (when needed), run a targeted sync, and replace the generic text.
 
 Clients can probe `GET /v1/capabilities`. Protocol version 1 advertises
 `encryptedForwarding`, `plaintextMetadata`, `pendingPoll`, and `unregister`, plus
-the webhook, APNs-payload, and pending-queue limits. Older relays may not expose
+the webhook, APNs-payload, and pending-queue limits, and `pendingWindowSeconds`
+when the queue is limited to the setup window. Older relays may not expose
 this endpoint, so clients should treat a 404/405 as an unknown legacy relay.
 The machine-readable contract is
 [`docs/fixtures/relay-protocol-v1.json`](docs/fixtures/relay-protocol-v1.json).

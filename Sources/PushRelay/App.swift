@@ -33,7 +33,9 @@ struct PushRelayMain {
             )
         }
 
-        let router = buildRouter(store: store, sender: sender, authToken: authToken)
+        let router = buildRouter(
+            store: store, sender: sender, authToken: authToken, pendingWindow: runtime.pendingWindow
+        )
         let configuration = ApplicationConfiguration(address: .hostname("0.0.0.0", port: port))
 
         // JMAP push URLs must be https (RFC 8620 §7.2) — serve TLS when a

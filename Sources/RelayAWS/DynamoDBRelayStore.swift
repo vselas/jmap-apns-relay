@@ -23,7 +23,9 @@ import RelayCore
 ///   survive; the sort key keeps them in arrival order.
 /// * Each push carries `expiresAt` for DynamoDB TTL. The queue only matters
 ///   for the app's verification poll, which comes within minutes, so a day
-///   is generous and keeps the table from growing without bound.
+///   is generous and keeps the table from growing without bound. The router
+///   only enqueues during a device's setup window (`pendingWindow`), so in
+///   production the table holds registrations and the odd verification.
 /// * The 50-entry cap is enforced on read (newest 50) and trimmed on drain;
 ///   TTL does the rest. Trimming on every webhook would cost a query per push.
 public struct DynamoDBRelayStore: RelayStorage {

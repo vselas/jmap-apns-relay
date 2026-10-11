@@ -51,9 +51,13 @@ if entitlements != nil {
 
 let router = buildRouter(
     context: LambdaContext.self, store: store, sender: sender,
-    authToken: runtime.authToken, entitlements: entitlements
+    authToken: runtime.authToken, entitlements: entitlements,
+    pendingWindow: runtime.pendingWindow
 )
-relayLog("[push] Lambda relay ready (mode \(runtime.mode.rawValue), table \(table))")
+relayLog(
+    "[push] Lambda relay ready (mode \(runtime.mode.rawValue), table \(table), "
+        + "pending window \(runtime.pendingWindow.map { "\(Int($0))s" } ?? "unlimited"))"
+)
 let lambda = LambdaFunction(
     router: router, event: TolerantFunctionURLRequest.self, output: FunctionURLResponse.self
 )

@@ -301,6 +301,104 @@ import Testing
         }
     }
 
+    // MARK: - Pending window
+
+    /// The queue exists for the verification a client polls for while it sets
+    /// up push. Every later push went to APNs; keeping it as well cost a write
+    /// per change and held a payload for a day that nobody would read.
+    @Test func pushesAreKeptOnlyWhileTheDeviceMayAwaitVerification() async throws {
+        let store = try RelayStore(persistenceURL: nil)
+        let sender = CountingSender()
+        let clock = Clock()
+        let app = Application(
+            router: buildRouter(
+                store: store, sender: sender, pendingWindow: 15 * 60, now: { clock.now }
+            )
+        )
+        try await app.test(.router) { client in
+            func push(_ text: String) async throws {
+                let response = try await client.execute(
+                    uri: "/v1/push/dev1", method: .post, body: ByteBuffer(string: text)
+                )
+                #expect(response.status == .ok)
+            }
+            func register() async throws {
+                _ = try await client.execute(
+                    uri: "/v1/register", method: .post,
+                    body: ByteBuffer(string: #"{"deviceId":"dev1","apnsToken":"tok"}"#)
+                )
+            }
+
+            try await register()
+            clock.advance(by: 60)
+            try await push("verification")
+            clock.advance(by: 15 * 60)
+            try await push("later")
+            #expect(try await store.drain(deviceId: "dev1").map(\.text) == ["verification"])
+
+            // Registering again (a launch, a new token) opens it again.
+            try await register()
+            try await push("after re-registering")
+            #expect(try await store.drain(deviceId: "dev1").map(\.text) == ["after re-registering"])
+        }
+        // Delivery does not depend on the window.
+        #expect(sender.count == 3)
+    }
+
+    /// Development has no APNs: the poll is how pushes arrive at all.
+    @Test func withoutAWindowEveryPushIsKept() async throws {
+        let store = try RelayStore(persistenceURL: nil)
+        let clock = Clock()
+        let app = Application(
+            router: buildRouter(store: store, sender: LogPushSender(), now: { clock.now })
+        )
+        try await app.test(.router) { client in
+            _ = try await client.execute(
+                uri: "/v1/register", method: .post, body: ByteBuffer(string: #"{"deviceId":"dev1"}"#)
+            )
+            clock.advance(by: 7 * 86_400)
+            _ = try await client.execute(
+                uri: "/v1/push/dev1", method: .post, body: ByteBuffer(string: "much later")
+            )
+        }
+        #expect(try await store.drain(deviceId: "dev1").map(\.text) == ["much later"])
+    }
+
+    @Test func theWindowIsPublishedWhenThereIsOne() async throws {
+        let app = Application(
+            router: buildRouter(
+                store: try RelayStore(persistenceURL: nil), sender: LogPushSender(), pendingWindow: 900
+            )
+        )
+        try await app.test(.router) { client in
+            let response = try await client.execute(uri: "/v1/capabilities", method: .get)
+            let root = try #require(
+                try JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any]
+            )
+            let limits = try #require(root["limits"] as? [String: Any])
+            #expect(limits["pendingWindowSeconds"] as? Int == 900)
+        }
+    }
+
+    @Test func theWindowDefaultsByModeAndCanBeSet() throws {
+        let production: [String: String] = [
+            "RELAY_MODE": "production", "RELAY_AUTH_TOKEN": "t",
+            "APNS_KEY": "k", "APNS_KEY_ID": "KEYID12345", "APNS_TEAM_ID": "TEAM123456",
+            "APNS_TOPIC": "com.example.app",
+        ]
+        #expect(try RuntimeConfiguration(environment: production).pendingWindow == 900)
+        #expect(try RuntimeConfiguration(environment: [:]).pendingWindow == nil)
+        var custom = production
+        custom["PENDING_WINDOW_SECONDS"] = "120"
+        #expect(try RuntimeConfiguration(environment: custom).pendingWindow == 120)
+        custom["PENDING_WINDOW_SECONDS"] = "0"
+        #expect(try RuntimeConfiguration(environment: custom).pendingWindow == nil)
+        custom["PENDING_WINDOW_SECONDS"] = "soon"
+        #expect(throws: RuntimeConfiguration.ConfigurationError.invalidPendingWindow("soon")) {
+            _ = try RuntimeConfiguration(environment: custom)
+        }
+    }
+
     @Test func tokenComparisonRejectsPrefixesAndLengths() {
         // A `hasPrefix`-style check would let "s3" through.
         #expect(!isAuthorized(request(bearer: "s3"), token: "s3cret"))
@@ -323,5 +421,17 @@ import Testing
 private struct InvalidTokenSender: PushSender {
     func send(_ push: PendingPush, to registration: DeviceRegistration) async -> DeliveryOutcome {
         .invalidToken(reason: "Unregistered")
+    }
+}
+
+/// Counts what it was asked to deliver.
+private final class CountingSender: PushSender, @unchecked Sendable {
+    private let lock = NSLock()
+    private var sent = 0
+    var count: Int { lock.withLock { sent } }
+
+    func send(_ push: PendingPush, to registration: DeviceRegistration) async -> DeliveryOutcome {
+        lock.withLock { sent += 1 }
+        return .delivered
     }
 }
