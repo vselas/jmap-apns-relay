@@ -34,6 +34,15 @@ public struct RuntimeConfiguration: Sendable {
     public var mode: RelayMode
     public var authToken: String?
     public var apns: APNsConfiguration?
+    /// How long after a device registers its webhooks are kept for
+    /// `/v1/pending`; nil keeps every push. See ``buildRouter``.
+    public var pendingWindow: TimeInterval?
+
+    /// The window a production relay uses unless `PENDING_WINDOW_SECONDS`
+    /// says otherwise. A client registers just before it creates its JMAP
+    /// subscription, and the server sends the verification within about a
+    /// minute of that, so fifteen leaves room for a slow server.
+    public static let defaultProductionPendingWindow: TimeInterval = 15 * 60
 
     public init(environment: [String: String]) throws {
         let modeValue = environment["RELAY_MODE"]?.lowercased() ?? "development"
@@ -47,12 +56,23 @@ public struct RuntimeConfiguration: Sendable {
             guard authToken != nil else { throw ConfigurationError.productionRequiresAuthToken }
             guard apns != nil else { throw ConfigurationError.productionRequiresAPNs }
         }
+        // Development keeps every push, because there `/v1/pending` is the
+        // only way a push reaches anyone. 0 asks for the same in production.
+        if let value = environment["PENDING_WINDOW_SECONDS"], !value.isEmpty {
+            guard let seconds = Int(value), seconds >= 0 else {
+                throw ConfigurationError.invalidPendingWindow(value)
+            }
+            pendingWindow = seconds == 0 ? nil : TimeInterval(seconds)
+        } else {
+            pendingWindow = mode == .production ? Self.defaultProductionPendingWindow : nil
+        }
     }
 
     public enum ConfigurationError: Error, Equatable {
         case invalidMode(String)
         case productionRequiresAuthToken
         case productionRequiresAPNs
+        case invalidPendingWindow(String)
     }
 }
 
@@ -83,12 +103,20 @@ public func isAuthorized(_ request: Request, token: String?) -> Bool {
 ///                                  verification poll)
 /// - `GET  /healthz`                liveness
 /// - `GET  /readyz`                 persistence readiness
+///
+/// `pendingWindow` limits which webhooks are kept for `/v1/pending` to those
+/// arriving within that long of the device's latest registration: the window
+/// in which a client is waiting for its subscription's verification. Every
+/// push after that went to APNs, and keeping it as well only cost a write and
+/// held a payload nobody would read. Nil keeps every push, as a development
+/// relay must.
 public func buildRouter<Context: RequestContext>(
     context: Context.Type = BasicRequestContext.self,
     store: any RelayStorage,
     sender: any PushSender,
     authToken: String? = nil,
     entitlements: EntitlementPolicy? = nil,
+    pendingWindow: TimeInterval? = nil,
     now: @escaping @Sendable () -> Date = { .now }
 ) -> Router<Context> {
     let router = Router(context: Context.self)
@@ -115,7 +143,7 @@ public func buildRouter<Context: RequestContext>(
                 "maxWebhookBytes": RelayLimits.maxWebhookBytes,
                 "maxAPNsPayloadBytes": APNsSender.maximumPayloadBytes,
                 "maxPendingPerDevice": RelayLimits.maxPendingPerDevice,
-            ],
+            ].merging(pendingWindow.map { ["pendingWindowSeconds": Int($0)] } ?? [:]) { $1 },
         ]
         let data = try JSONSerialization.data(withJSONObject: capabilities)
         return Response(
@@ -138,7 +166,7 @@ public func buildRouter<Context: RequestContext>(
             throw HTTPError(.badRequest)
         }
         guard let entitlements else {
-            let stored = try await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken))
+            let stored = try await store.register(DeviceRegistration(deviceId: body.deviceId, apnsToken: body.apnsToken, registeredAt: now()))
             logRegistration(sent: body.apnsToken, stored: stored)
             return Response(status: .noContent)
         }
@@ -178,6 +206,7 @@ public func buildRouter<Context: RequestContext>(
             DeviceRegistration(
                 deviceId: body.deviceId,
                 apnsToken: body.apnsToken,
+                registeredAt: now(),
                 entitlementId: entitlement.originalTransactionId
             )
         )
@@ -243,10 +272,19 @@ public func buildRouter<Context: RequestContext>(
             body: body,
             contentEncoding: request.headers[.contentEncoding]
         )
-        try await store.enqueue(deviceId: deviceId, push: push)
-        // Queued either way: the subscription's verification code has to
-        // reach the app's poll even before anyone pays, or the app could
-        // never finish setting push up. What payment buys is the APNs leg.
+        // Kept for the poll only while the device may be waiting for its
+        // verification (see `pendingWindow`). A re-registration (every launch,
+        // every new token) opens the window again.
+        let awaitingVerification = pendingWindow.map {
+            now().timeIntervalSince(registration.registeredAt) < $0
+        } ?? true
+        if awaitingVerification {
+            try await store.enqueue(deviceId: deviceId, push: push)
+        }
+        // Queued whether or not anyone has paid: the subscription's
+        // verification code has to reach the app's poll even before anyone
+        // pays, or the app could never finish setting push up. What payment
+        // buys is the APNs leg.
         if let entitlements {
             let active: Bool
             if let id = registration.entitlementId, let entitlement = try await store.entitlement(id: id) {
