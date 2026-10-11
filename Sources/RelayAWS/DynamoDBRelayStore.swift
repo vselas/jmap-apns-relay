@@ -50,20 +50,40 @@ public struct DynamoDBRelayStore: RelayStorage {
 
     // MARK: - Registrations
 
-    public func register(_ registration: DeviceRegistration) async throws {
-        var item: [String: Any] = [
-            "pk": ["S": Self.partitionKey(registration.deviceId)],
-            "sk": ["S": Self.registrationKey],
-            "deviceId": ["S": registration.deviceId],
-            "registeredAt": ["N": Self.number(registration.registeredAt)],
+    @discardableResult
+    public func register(_ registration: DeviceRegistration) async throws -> DeviceRegistration {
+        // UpdateItem, not PutItem: a whole-item put from a registration
+        // without a token erased the stored one (see `RelayStorage.register`).
+        // SET creates the item when there is none, and the update is atomic,
+        // so two instances registering the same device at once cannot lose
+        // the token whichever lands last.
+        var set = ["deviceId = :deviceId", "registeredAt = :registeredAt"]
+        var values: [String: Any] = [
+            ":deviceId": ["S": registration.deviceId],
+            ":registeredAt": ["N": Self.number(registration.registeredAt)],
         ]
         if let token = registration.apnsToken {
-            item["apnsToken"] = ["S": token]
+            set.append("apnsToken = :apnsToken")
+            values[":apnsToken"] = ["S": token]
         }
+        var expression = "SET " + set.joined(separator: ", ")
         if let entitlementId = registration.entitlementId {
-            item["entitlementId"] = ["S": entitlementId]
+            expression += ", entitlementId = :entitlementId"
+            values[":entitlementId"] = ["S": entitlementId]
+        } else {
+            expression += " REMOVE entitlementId"
         }
-        _ = try await dynamo("PutItem", ["TableName": table, "Item": item])
+        let response = try await dynamo("UpdateItem", [
+            "TableName": table,
+            "Key": registrationKey(registration.deviceId),
+            "UpdateExpression": expression,
+            "ExpressionAttributeValues": values,
+            "ReturnValues": "ALL_NEW",
+        ])
+        guard let item = response["Attributes"] as? [String: Any] else {
+            throw AWSError.malformedResponse("UpdateItem returned no attributes")
+        }
+        return try Self.decodeRegistration(item, deviceId: registration.deviceId)
     }
 
     public func registration(deviceId: String) async throws -> DeviceRegistration? {

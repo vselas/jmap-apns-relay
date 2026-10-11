@@ -132,8 +132,19 @@ public actor APNsSender: PushSender {
                 body: configuration.alertBody
             )
             request.body = .bytes(ByteBuffer(bytes: payload))
-            let response = try await httpClient.execute(request, timeout: .seconds(10))
-            guard response.status != .ok else { return .delivered }
+            let prepared = request
+            let response = try await retryingStaleConnection("APNs") { [httpClient] in
+                try await httpClient.execute(prepared, timeout: .seconds(10))
+            }
+            guard response.status != .ok else {
+                // Logged, unlike before: a delivered push left no line, so a
+                // device that got none looked exactly like one that got all
+                // of them. The apns-id is what Apple's Push Notifications
+                // Console looks a delivery up by.
+                let apnsId = response.headers.first(name: "apns-id") ?? "?"
+                relayLog("[push] APNs 200 for \(registration.deviceId) (apns-id \(apnsId))")
+                return .delivered
+            }
             let body = try? await response.body.collect(upTo: 4 * 1024)
             let text = body.map { String(buffer: $0) } ?? ""
             let reason = Self.responseReason(text) ?? "HTTP \(response.status.code)"

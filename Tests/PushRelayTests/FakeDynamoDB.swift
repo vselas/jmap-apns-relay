@@ -2,8 +2,8 @@ import Foundation
 import RelayAWS
 
 /// An in-memory DynamoDB that speaks just enough of the JSON protocol for
-/// ``DynamoDBRelayStore``: PutItem, GetItem, DeleteItem, UpdateItem (REMOVE
-/// with an equality condition), Query (pk = and begins_with on sk, with
+/// ``DynamoDBRelayStore``: PutItem, GetItem, DeleteItem, UpdateItem (an upsert
+/// by `SET … [REMOVE …]`, or REMOVE with an equality condition), Query (pk = and begins_with on sk, with
 /// pagination), and BatchWriteItem deletes. Requests are round-tripped through
 /// JSON so a value that would not serialise fails here as it would on AWS.
 actor FakeDynamoDB: AWSJSONTransport {
@@ -67,6 +67,24 @@ actor FakeDynamoDB: AWSJSONTransport {
             let (pk, sk) = keys(request["Key"] as? [String: Any] ?? [:])
             let old = items[pk]?.removeValue(forKey: sk)
             return old.map { ["Attributes": $0] } ?? [:]
+        case "UpdateItem" where (request["UpdateExpression"] as? String)?.hasPrefix("SET ") == true:
+            // `SET a = :a, b = :b [REMOVE c, d]`, creating the item if absent.
+            let key = request["Key"] as? [String: Any] ?? [:]
+            let (pk, sk) = keys(key)
+            let values = request["ExpressionAttributeValues"] as? [String: Any] ?? [:]
+            let expression = String((request["UpdateExpression"] as? String ?? "").dropFirst("SET ".count))
+            let parts = expression.components(separatedBy: " REMOVE ")
+            var item = items[pk]?[sk] ?? key
+            for assignment in parts[0].components(separatedBy: ", ") {
+                let sides = assignment.components(separatedBy: " = ")
+                precondition(sides.count == 2, assignment)
+                item[sides[0]] = values[sides[1]]
+            }
+            if parts.count > 1 {
+                for name in parts[1].components(separatedBy: ", ") { item.removeValue(forKey: name) }
+            }
+            items[pk, default: [:]][sk] = item
+            return request["ReturnValues"] as? String == "ALL_NEW" ? ["Attributes": item] : [:]
         case "UpdateItem":
             let (pk, sk) = keys(request["Key"] as? [String: Any] ?? [:])
             let values = request["ExpressionAttributeValues"] as? [String: Any] ?? [:]

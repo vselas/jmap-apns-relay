@@ -292,8 +292,13 @@ OrcaMail account requested 1000 on 2026-10-10.)
 # Live logs
 aws logs tail /aws/lambda/jmap-apns-relay-prod --follow
 
-# Only the relay's own lines (registrations refused, APNs outcomes, errors)
+# Only the relay's own lines: every registration ("token …a1b2c3 sent",
+# "no token sent, kept …a1b2c3"), every APNs outcome including
+# "APNs 200 … (apns-id …)", skips, and errors
 aws logs tail /aws/lambda/jmap-apns-relay-prod --since 1h --filter-pattern '"[push]"'
+
+# One device's history: registrations, deliveries and skips
+aws logs tail /aws/lambda/jmap-apns-relay-prod --since 1d --filter-pattern '"orcamail-<device id>"'
 
 # Errors and invocations, last hour
 for m in Errors Invocations Throttles; do
@@ -366,6 +371,8 @@ Function URL lose push. The certificate stack in us-east-1 is separate:
 | Stack fails: "decreases account's UnreservedConcurrentExecution below its minimum value of [10]" | New account, quota 10 | The script now handles it; re-run. See [Quotas](#quotas). |
 | Stack stuck in `ROLLBACK_COMPLETE` after a failed first create | CloudFormation cannot update such a stack | The script deletes and recreates it. If the table survived (it is retained), check it is empty, then delete it. |
 | JMAP server's webhook gets 502, Lambda `Errors` rises, no `[push]` line | The event did not decode. Seen 2026-10-10: Stalwart sends no `User-Agent`, Lambda sets `userAgent: null`, and `AWSLambdaEvents.FunctionURLRequest` requires a string | Fixed by `TolerantFunctionURLRequest`. For a new variant, see [Monitoring](#monitoring). |
+| `no APNs token for <device>; skipping` on every push, the device registered | The registration never got a token, or `BadDeviceToken` removed it. Seen 2026-10-11: the app's tokenless launch registration landed after the one carrying the token and erased it | Fixed: a registration without a token keeps the stored one. Look for the device's `registered` lines; the app sends its token again when iOS issues one. |
+| `stale connection (…), retrying once` | The first request after a frozen instance thaws went out on a pooled connection that died meanwhile | Expected, and retried. Before the retry the webhook answered 500 with `I/O on closed channel` and that push was lost. A second failure is logged as an error. |
 | `BadDeviceToken` for every push to a device | Build/stack APNs environment mismatch | Use the matching stack (see [APNs environments](#apns-environments-which-stack-serves-which-build)). |
 | `InvalidProviderToken` | Wrong key id or team id, or a revoked key | Check with `Tools/apns-push.swift --check`, redeploy with the right values. |
 | Registration 401 | App and relay tokens differ | Compare the app's build setting with SSM; see [Secrets](#secrets-and-rotation). |
