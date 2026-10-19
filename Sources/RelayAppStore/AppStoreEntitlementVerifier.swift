@@ -11,7 +11,10 @@ public struct AppStoreEntitlementVerifier: EntitlementVerifier {
         public var bundleId: String
         /// The app's numeric App Store id; Apple requires it for production.
         public var appAppleId: Int64?
-        public var environment: AppStoreServerLibrary.AppStoreEnvironment
+        /// The environments whose purchases count, tried in order. App Store
+        /// purchases are `production`; TestFlight and App Review purchases are
+        /// `sandbox`, so a relay serving both kinds of build accepts both.
+        public var environments: [AppStoreServerLibrary.AppStoreEnvironment]
         /// Products that grant push, e.g. the Pro subscription's ids.
         public var productIds: Set<String>
         /// Apple's root certificates (DER). `AppleRootCertificates.all` ships
@@ -29,9 +32,23 @@ public struct AppStoreEntitlementVerifier: EntitlementVerifier {
             rootCertificates: [Data] = AppleRootCertificates.all,
             onlineChecks: Bool = true
         ) {
+            self.init(
+                bundleId: bundleId, appAppleId: appAppleId, environments: [environment],
+                productIds: productIds, rootCertificates: rootCertificates, onlineChecks: onlineChecks
+            )
+        }
+
+        public init(
+            bundleId: String,
+            appAppleId: Int64?,
+            environments: [AppStoreServerLibrary.AppStoreEnvironment],
+            productIds: Set<String>,
+            rootCertificates: [Data] = AppleRootCertificates.all,
+            onlineChecks: Bool = true
+        ) {
             self.bundleId = bundleId
             self.appAppleId = appAppleId
-            self.environment = environment
+            self.environments = environments
             self.productIds = productIds
             self.rootCertificates = rootCertificates
             self.onlineChecks = onlineChecks
@@ -44,37 +61,69 @@ public struct AppStoreEntitlementVerifier: EntitlementVerifier {
         /// forged transaction, so it refuses to start instead.
         case unverifiedEnvironment(String)
         case noProducts
+        case noEnvironments
     }
 
-    let configuration: Configuration
-    let verifier: SignedDataVerifier
+    public let configuration: Configuration
+    /// One per configured environment, in the configuration's order.
+    let verifiers: [SignedDataVerifier]
 
     public init(configuration: Configuration) throws {
-        switch configuration.environment {
-        case .production, .sandbox: break
-        default: throw ConfigurationError.unverifiedEnvironment(configuration.environment.rawValue)
+        guard !configuration.environments.isEmpty else { throw ConfigurationError.noEnvironments }
+        for environment in configuration.environments {
+            switch environment {
+            case .production, .sandbox: break
+            default: throw ConfigurationError.unverifiedEnvironment(environment.rawValue)
+            }
         }
         guard !configuration.productIds.isEmpty else { throw ConfigurationError.noProducts }
         self.configuration = configuration
-        self.verifier = try SignedDataVerifier(
-            rootCertificates: configuration.rootCertificates,
-            bundleId: configuration.bundleId,
-            appAppleId: configuration.appAppleId,
-            environment: configuration.environment,
-            enableOnlineChecks: configuration.onlineChecks
-        )
+        self.verifiers = try configuration.environments.map { environment in
+            try SignedDataVerifier(
+                rootCertificates: configuration.rootCertificates,
+                bundleId: configuration.bundleId,
+                appAppleId: configuration.appAppleId,
+                environment: environment,
+                enableOnlineChecks: configuration.onlineChecks
+            )
+        }
+    }
+
+    /// Runs `check` with each environment's verifier in turn and returns the
+    /// first answer that isn't an environment mismatch, with the verifier that
+    /// gave it. Every other check (signature, chain, bundle id) is the same
+    /// in each, so only the environment decides which one answers.
+    func firstMatching<T>(
+        _ check: (SignedDataVerifier) async -> VerificationResult<T>
+    ) async throws -> (T, SignedDataVerifier) {
+        var last: VerificationResult<T>?
+        for verifier in verifiers {
+            let result = await check(verifier)
+            if case .invalid(.INVALID_ENVIRONMENT) = result {
+                last = result
+                continue
+            }
+            return (try Self.unwrap(result), verifier)
+        }
+        // Init guarantees at least one verifier, so `last` is set here.
+        guard let last else { throw EntitlementError.invalidProof("no environment configured") }
+        return (try Self.unwrap(last), verifiers[verifiers.count - 1])
     }
 
     public func verify(_ proof: EntitlementProof) async throws -> Entitlement {
         guard case .signedTransaction(let jws) = proof else {
             throw EntitlementError.invalidProof("unsupported proof")
         }
-        let transaction = try Self.unwrap(await verifier.verifyAndDecodeTransaction(signedTransaction: jws))
+        let (transaction, _) = try await firstMatching { await $0.verifyAndDecodeTransaction(signedTransaction: jws) }
         return try entitlement(from: transaction, status: nil)
     }
 
     public func verifyNotification(signedPayload: String) async throws -> Entitlement? {
-        let notification = try Self.unwrap(await verifier.verifyAndDecodeNotification(signedPayload: signedPayload))
+        // The transaction and renewal inside are checked by the verifier that
+        // accepted the notification: they share its environment.
+        let (notification, verifier) = try await firstMatching {
+            await $0.verifyAndDecodeNotification(signedPayload: signedPayload)
+        }
         if notification.notificationType == .test { return nil }
         guard let data = notification.data, let signedTransaction = data.signedTransactionInfo else {
             // Summary, external-purchase and consumption notifications carry
@@ -145,7 +194,10 @@ extension AppStoreEntitlementVerifier {
     ///     APPSTORE_PRODUCT_IDS=de.vselas.orcamail.pro.yearly,de.vselas.orcamail.pro.monthly
     ///     APPSTORE_BUNDLE_ID=de.vselas.orcamail      (defaults to APNS_TOPIC)
     ///     APPSTORE_APP_APPLE_ID=1234567890           (required for Production)
-    ///     APPSTORE_ENVIRONMENT=Production | Sandbox  (default Production)
+    ///     APPSTORE_ENVIRONMENT=Production | Sandbox | Production,Sandbox  (default Production)
+    ///
+    /// `Production,Sandbox` serves App Store builds and TestFlight (whose
+    /// purchases are sandbox transactions) from one relay.
     public static func fromEnvironment(_ environment: [String: String]) throws -> AppStoreEntitlementVerifier? {
         func value(_ name: String) -> String? {
             environment[name].flatMap { $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0 }
@@ -155,25 +207,32 @@ extension AppStoreEntitlementVerifier {
         guard let bundleId = value("APPSTORE_BUNDLE_ID") ?? value("APNS_TOPIC") else {
             throw EnvironmentError.missing("APPSTORE_BUNDLE_ID")
         }
-        let environmentName = value("APPSTORE_ENVIRONMENT") ?? "Production"
-        let appStoreEnvironment: AppStoreServerLibrary.AppStoreEnvironment
-        switch environmentName.lowercased() {
-        case "production": appStoreEnvironment = .production
-        case "sandbox": appStoreEnvironment = .sandbox
-        default: throw ConfigurationError.unverifiedEnvironment(environmentName)
+        let environmentNames = (value("APPSTORE_ENVIRONMENT") ?? "Production")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var appStoreEnvironments: [AppStoreServerLibrary.AppStoreEnvironment] = []
+        for name in environmentNames {
+            let environment: AppStoreServerLibrary.AppStoreEnvironment
+            switch name.lowercased() {
+            case "production": environment = .production
+            case "sandbox": environment = .sandbox
+            default: throw ConfigurationError.unverifiedEnvironment(name)
+            }
+            if !appStoreEnvironments.contains(environment) { appStoreEnvironments.append(environment) }
         }
         let appAppleId = try value("APPSTORE_APP_APPLE_ID").map { raw -> Int64 in
             guard let id = Int64(raw) else { throw EnvironmentError.invalid("APPSTORE_APP_APPLE_ID") }
             return id
         }
-        if appStoreEnvironment == .production, appAppleId == nil {
+        if appStoreEnvironments.contains(.production), appAppleId == nil {
             throw EnvironmentError.missing("APPSTORE_APP_APPLE_ID")
         }
         return try AppStoreEntitlementVerifier(
             configuration: Configuration(
                 bundleId: bundleId,
                 appAppleId: appAppleId,
-                environment: appStoreEnvironment,
+                environments: appStoreEnvironments,
                 productIds: productIds
             )
         )

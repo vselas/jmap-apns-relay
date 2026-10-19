@@ -54,8 +54,8 @@ Parameters:
   AppStoreEnvironment:
     Type: String
     Default: Production
-    AllowedValues: [Production, Sandbox]
-    Description: Production accepts App Store and TestFlight purchases; Sandbox, sandbox-account ones.
+    AllowedValues: [Production, Sandbox, "Production,Sandbox"]
+    Description: Production accepts App Store purchases; Sandbox, TestFlight, App Review and sandbox-account ones; Production,Sandbox, both.
   MaxDevicesPerSubscription:
     Type: Number
     Default: 10
