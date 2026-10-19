@@ -223,7 +223,9 @@ Notifications → Use Custom Relay). The same `.p8` works for both hosts.
 
 ## App Store subscription gating
 
-Off in production today. To turn it on once OrcaMail sells a push product:
+On in production since 2026-10-19 (OrcaMail Pro, both products,
+`APPSTORE_ENVIRONMENT=Production,Sandbox`). Every redeploy must pass the App
+Store variables again, or CloudFormation turns gating off. How it was turned on:
 
 1. Create the subscription in App Store Connect and note its product id and
    the app's numeric Apple ID (App Information → Apple ID).
