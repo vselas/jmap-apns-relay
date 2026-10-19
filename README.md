@@ -308,8 +308,9 @@ subscription's verification code reaches `/v1/pending` before anyone pays. Only
 the APNs leg is gated: an unpaid device's webhooks answer 200 and send nothing.
 
 **Keeping current.** Point App Store Connect's *App Store Server Notifications*
-(Version 2) at `https://<relay>/v1/appstore/notifications`; the deploy script
-prints the URL. Renewals, billing-grace periods, expiries, refunds and refund
+(Version 2) at `https://<relay>/v1/appstore/notifications`, or have the service
+that already holds those URLs (RevenueCat, for one) forward them there
+unchanged; the deploy script prints the URL. Renewals, billing-grace periods, expiries, refunds and refund
 reversals then update the subscription without the app. Each notification is
 verified like a transaction, and an older one arriving after a newer one is
 ignored. Pushes keep flowing for an hour past a period's end, so a renewal

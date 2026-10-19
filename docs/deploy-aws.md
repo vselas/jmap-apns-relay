@@ -236,11 +236,16 @@ Store variables again, or CloudFormation turns gating off. How it was turned on:
    so a relay that serves TestFlight testers needs `Sandbox` in the list;
    `Production` alone refuses every TestFlight subscriber with
    `entitlementInvalid`. App Review purchases are sandbox too.
-3. In App Store Connect → App Information → App Store Server Notifications,
-   set **both** the Production and the Sandbox URL (Version 2) to the
-   `AppStoreNotificationURL` output, `<relay URL>v1/appstore/notifications`.
-   Sandbox notifications carry TestFlight renewals, expiries and refunds. Use
-   "Request a Test Notification" for each and look for them in the logs.
+3. Get App Store Server Notifications (Version 2) to
+   `<relay URL>v1/appstore/notifications` (the `AppStoreNotificationURL`
+   output), for Production **and** Sandbox: sandbox notifications carry
+   TestFlight renewals, expiries and refunds. Apple allows one URL per
+   environment, so if a purchases service such as RevenueCat already holds App
+   Store Connect's URLs, leave them and use its forwarding instead (RevenueCat:
+   "Apple Server Notification Forwarding URL"; OrcaMail does this). Forwarding
+   passes Apple's signed payload on unchanged, so the relay verifies it as
+   usual. Only rejected or deferred notifications are logged; a successful
+   renewal shows as the entitlement's `periodEndsAt` moving forward.
 
 From then on, `/v1/register` needs the StoreKit 2 `signedTransaction`, and the
 app must handle the 402/403/503 refusals (see the
