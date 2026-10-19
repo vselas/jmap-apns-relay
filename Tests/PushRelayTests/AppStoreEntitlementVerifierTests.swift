@@ -135,8 +135,93 @@ import Testing
         )
         #expect(verifier.configuration.productIds == [Self.product, "de.vselas.orcamail.pro.monthly"])
         #expect(verifier.configuration.bundleId == Self.bundleId)
-        #expect(verifier.configuration.environment == .production)
+        #expect(verifier.configuration.environments == [.production])
         #expect(verifier.configuration.rootCertificates == AppleRootCertificates.all)
+    }
+
+    @Test func bothEnvironmentsFromTheEnvironment() throws {
+        let both = try #require(
+            try AppStoreEntitlementVerifier.fromEnvironment([
+                "APPSTORE_PRODUCT_IDS": Self.product, "APNS_TOPIC": Self.bundleId,
+                "APPSTORE_APP_APPLE_ID": "1234567890", "APPSTORE_ENVIRONMENT": " Production , sandbox ",
+            ])
+        )
+        #expect(both.configuration.environments == [.production, .sandbox])
+        // Production is in the list, so Apple's app id is still required.
+        #expect(throws: AppStoreEntitlementVerifier.EnvironmentError.missing("APPSTORE_APP_APPLE_ID")) {
+            _ = try AppStoreEntitlementVerifier.fromEnvironment([
+                "APPSTORE_PRODUCT_IDS": Self.product, "APNS_TOPIC": Self.bundleId,
+                "APPSTORE_ENVIRONMENT": "Production,Sandbox",
+            ])
+        }
+        let sandbox = try #require(
+            try AppStoreEntitlementVerifier.fromEnvironment([
+                "APPSTORE_PRODUCT_IDS": Self.product, "APNS_TOPIC": Self.bundleId, "APPSTORE_ENVIRONMENT": "Sandbox",
+            ])
+        )
+        #expect(sandbox.configuration.environments == [.sandbox])
+        #expect(throws: AppStoreEntitlementVerifier.ConfigurationError.unverifiedEnvironment("Xcode")) {
+            _ = try AppStoreEntitlementVerifier.fromEnvironment([
+                "APPSTORE_PRODUCT_IDS": Self.product, "APNS_TOPIC": Self.bundleId,
+                "APPSTORE_APP_APPLE_ID": "1", "APPSTORE_ENVIRONMENT": "Production,Xcode",
+            ])
+        }
+        #expect(throws: AppStoreEntitlementVerifier.ConfigurationError.noEnvironments) {
+            _ = try AppStoreEntitlementVerifier.fromEnvironment([
+                "APPSTORE_PRODUCT_IDS": Self.product, "APNS_TOPIC": Self.bundleId, "APPSTORE_ENVIRONMENT": " , ",
+            ])
+        }
+    }
+
+    // MARK: - Both environments (App Store and TestFlight on one relay)
+
+    func makeBothVerifier(_ signer: FakeAppleSigner) throws -> AppStoreEntitlementVerifier {
+        try AppStoreEntitlementVerifier(
+            configuration: .init(
+                bundleId: Self.bundleId, appAppleId: 1_234_567_890, environments: [.production, .sandbox],
+                productIds: [Self.product], rootCertificates: [signer.rootDER], onlineChecks: false
+            )
+        )
+    }
+
+    @Test func bothEnvironmentsAcceptAppStoreAndTestFlightPurchases() async throws {
+        let signer = try FakeAppleSigner()
+        let verifier = try makeBothVerifier(signer)
+        for environment in ["Production", "Sandbox"] {
+            let entitlement = try await verifier.verify(.signedTransaction(signer.sign(transaction(environment: environment))))
+            #expect(entitlement.productId == Self.product)
+        }
+    }
+
+    @Test func bothEnvironmentsStillRefuseForgeriesAndOtherApps() async throws {
+        let signer = try FakeAppleSigner()
+        let verifier = try makeBothVerifier(signer)
+        // Falling through to the next environment never weakens another check.
+        await #expect(throws: EntitlementError.self) {
+            _ = try await verifier.verify(.signedTransaction(signer.sign(transaction(bundle: "com.other.app"))))
+        }
+        await #expect(throws: EntitlementError.self) {
+            _ = try await verifier.verify(.signedTransaction(signer.sign(transaction(environment: "Xcode"))))
+        }
+        let stranger = try FakeAppleSigner()
+        await #expect(throws: EntitlementError.self) {
+            _ = try await verifier.verify(.signedTransaction(stranger.sign(transaction(environment: "Sandbox"))))
+        }
+    }
+
+    @Test func bothEnvironmentsTakeSandboxNotifications() async throws {
+        let signer = try FakeAppleSigner()
+        let renewedUntil = Date(timeIntervalSince1970: (Date.now.timeIntervalSince1970 + 86400 * 30).rounded())
+        let entitlement = try #require(
+            try await makeBothVerifier(signer).verifyNotification(
+                signedPayload: notification(
+                    type: "DID_RENEW",
+                    transaction: transaction(expires: renewedUntil),
+                    signer: signer
+                )
+            )
+        )
+        #expect(entitlement.expiresAt == renewedUntil)
     }
 
     @Test func theEmbeddedAppleRootIsIntact() {

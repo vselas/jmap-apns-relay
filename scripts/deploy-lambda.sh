@@ -26,7 +26,7 @@
 # Selling push (App Store subscription required for APNs delivery):
 #   APPSTORE_PRODUCT_IDS=de.vselas.orcamail.pro.yearly,de.vselas.orcamail.pro.monthly
 #   APPSTORE_APP_APPLE_ID=1234567890     # App Store Connect → App Information → Apple ID
-#   APPSTORE_ENVIRONMENT=Production      # or Sandbox
+#   APPSTORE_ENVIRONMENT=Production      # or Sandbox, or Production,Sandbox (App Store + TestFlight)
 #   MAX_DEVICES_PER_SUBSCRIPTION=10
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

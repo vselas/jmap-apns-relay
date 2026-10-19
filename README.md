@@ -277,7 +277,7 @@ APNs. Set `APPSTORE_PRODUCT_IDS` and it does; leave it unset and nothing changes
 | `APPSTORE_PRODUCT_IDS` | Comma-separated product ids that grant push. Turns the feature on. |
 | `APPSTORE_BUNDLE_ID` | Defaults to `APNS_TOPIC`. |
 | `APPSTORE_APP_APPLE_ID` | The app's numeric App Store id; required for `Production`. |
-| `APPSTORE_ENVIRONMENT` | `Production` (default; App Store and TestFlight) or `Sandbox`. `Xcode` and `LocalTesting` are refused: Apple's library skips signature checks for them. |
+| `APPSTORE_ENVIRONMENT` | `Production` (default; App Store purchases), `Sandbox` (TestFlight, App Review and sandbox-account purchases) or `Production,Sandbox` (both, tried in that order). A relay serving TestFlight builds needs `Sandbox` in the list: TestFlight purchases are sandbox transactions, whatever APNs environment the build uses. `Xcode` and `LocalTesting` are refused: Apple's library skips signature checks for them. |
 | `APPSTORE_MAX_DEVICES` | Registrations one subscription may hold (default 10; each account on each device is one). |
 
 **How a client proves it paid.** `POST /v1/register` gains an optional

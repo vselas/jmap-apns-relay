@@ -152,7 +152,7 @@ defaults for the rest), or CloudFormation resets it. The parameters are:
 | `RESERVED_CONCURRENCY` | `20` (0 when the account cannot spare it) | `ReservedConcurrency` |
 | `APPSTORE_PRODUCT_IDS` | empty: gating off | `AppStoreProductIds` |
 | `APPSTORE_APP_APPLE_ID` | empty | `AppStoreAppAppleId` |
-| `APPSTORE_ENVIRONMENT` | `Production` | `AppStoreEnvironment` |
+| `APPSTORE_ENVIRONMENT` | `Production` (or `Sandbox`, or `Production,Sandbox`) | `AppStoreEnvironment` |
 | `MAX_DEVICES_PER_SUBSCRIPTION` | `10` | `MaxDevicesPerSubscription` |
 | `DOMAIN_NAME` | the stack's current one | `DomainName` (plus `CertificateArn`, `HostedZoneId`, both derived) |
 
@@ -228,11 +228,17 @@ Off in production today. To turn it on once OrcaMail sells a push product:
 1. Create the subscription in App Store Connect and note its product id and
    the app's numeric Apple ID (App Information → Apple ID).
 2. Redeploy with
-   `APPSTORE_PRODUCT_IDS=<id>[,<id>] APPSTORE_APP_APPLE_ID=<apple id>`.
+   `APPSTORE_PRODUCT_IDS=<id>[,<id>] APPSTORE_APP_APPLE_ID=<apple id>
+   APPSTORE_ENVIRONMENT=Production,Sandbox`. TestFlight purchases are
+   **sandbox** transactions even though TestFlight builds use production APNs,
+   so a relay that serves TestFlight testers needs `Sandbox` in the list;
+   `Production` alone refuses every TestFlight subscriber with
+   `entitlementInvalid`. App Review purchases are sandbox too.
 3. In App Store Connect → App Information → App Store Server Notifications,
-   set the **Production** URL (Version 2) to the `AppStoreNotificationURL`
-   output, `<relay URL>v1/appstore/notifications`. Use "Request a Test
-   Notification" and look for it in the logs.
+   set **both** the Production and the Sandbox URL (Version 2) to the
+   `AppStoreNotificationURL` output, `<relay URL>v1/appstore/notifications`.
+   Sandbox notifications carry TestFlight renewals, expiries and refunds. Use
+   "Request a Test Notification" for each and look for them in the logs.
 
 From then on, `/v1/register` needs the StoreKit 2 `signedTransaction`, and the
 app must handle the 402/403/503 refusals (see the

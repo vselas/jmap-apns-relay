@@ -37,14 +37,16 @@ let sender = try await makeSender(runtime: runtime, httpClient: httpClient, owns
 // Selling push: APPSTORE_PRODUCT_IDS turns it on. A registration then needs
 // Apple's signature on an active subscription *in addition to* the shared
 // token: the token keeps scripted clients out, the subscription is what pays.
-let entitlements = try AppStoreEntitlementVerifier.fromEnvironment(environment).map {
+let appStoreVerifier = try AppStoreEntitlementVerifier.fromEnvironment(environment)
+let entitlements = appStoreVerifier.map {
     EntitlementPolicy(
         verifier: $0,
         maxDevicesPerEntitlement: environment["APPSTORE_MAX_DEVICES"].flatMap(Int.init) ?? 10
     )
 }
-if entitlements != nil {
-    relayLog("[push] App Store entitlements required for APNs delivery")
+if let appStoreVerifier {
+    let accepted = appStoreVerifier.configuration.environments.map(\.rawValue).joined(separator: ", ")
+    relayLog("[push] App Store entitlements required for APNs delivery (accepting \(accepted))")
 } else if runtime.authToken == nil {
     relayLog("[push] WARNING: RELAY_AUTH_TOKEN is not set — /v1/register accepts any device id.")
 }
