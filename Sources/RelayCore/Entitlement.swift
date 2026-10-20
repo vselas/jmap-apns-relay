@@ -41,6 +41,20 @@ public struct Entitlement: Sendable, Codable, Equatable {
         return expiresAt.addingTimeInterval(grace) > now
     }
 
+    /// How long an entitlement is kept once it pays for nothing: after Apple
+    /// revoked it or its last period ended. Without a limit every lapsed
+    /// subscription would stay forever (GDPR storage limitation). Deleting it
+    /// costs a returning subscriber nothing: the app sends its signed
+    /// transaction with every registration, and the relay stores it again.
+    public static let retention: TimeInterval = 90 * 24 * 3600
+
+    /// When this entitlement may be deleted: `retention` after it was revoked,
+    /// or else after its period ends. Nil for a non-expiring product still held.
+    public func deletableAfter(retention: TimeInterval = Entitlement.retention) -> Date? {
+        guard let end = revokedAt ?? expiresAt else { return nil }
+        return end.addingTimeInterval(retention)
+    }
+
     /// Applies newer signed data; older data than what is held is ignored.
     public func merged(with newer: Entitlement) -> Entitlement {
         newer.signedAt >= signedAt ? newer : self

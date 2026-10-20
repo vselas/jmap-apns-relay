@@ -248,6 +248,17 @@ app must handle the 402/403/503 refusals (see the
 side first**: turning gating on before the app sends a transaction stops push
 for every installed copy.
 
+**Retention.** Entitlement items carry the table's TTL attribute `expiresAt`,
+set to 90 days after the period ends or the purchase is revoked, so lapsed
+subscriptions are deleted. The privacy policy names this period; change
+`Entitlement.retention` and the policy together. Items written before this
+existed (2026-10-20) had no TTL; give them one once, after deploying:
+
+```bash
+AWS_PROFILE=orcamail AWS_REGION=eu-central-1 scripts/backfill-entitlement-ttl.py          # dry run
+AWS_PROFILE=orcamail AWS_REGION=eu-central-1 scripts/backfill-entitlement-ttl.py --apply
+```
+
 ## Secrets and rotation
 
 **Auth token.** The same value is built into the shipped app (OrcaMail's
