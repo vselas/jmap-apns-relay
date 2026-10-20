@@ -11,13 +11,15 @@ import RelayCore
 /// |------------------|------------------------|----------------------------------------|
 /// | `device#<id>`    | `registration`         | `apnsToken?`, `registeredAt`           |
 /// | `device#<id>`    | `push#<time>#<nonce>`  | `body` (binary), `contentEncoding?`, `receivedAt`, `expiresAt` |
-/// | `entitlement#<originalTransactionId>` | `entitlement` | `productId`, `expiresAt?` → `periodEndsAt`, `revokedAt?`, `signedAt` |
+/// | `entitlement#<originalTransactionId>` | `entitlement` | `productId`, `expiresAt?` → `periodEndsAt`, `revokedAt?`, `signedAt`, `expiresAt` (TTL) |
 ///
 /// A registration that is paid for also carries `entitlementId`, which the
 /// `byEntitlement` index (keys `entitlementId` + `pk`, keys only) projects so
 /// counting a subscription's devices is one Query, not a scan. The period end
 /// is stored as `periodEndsAt`, never `expiresAt`: that name is the table's
 /// TTL attribute, and DynamoDB would delete the entitlement when it lapsed.
+/// An entitlement's `expiresAt` is instead `Entitlement.deletableAfter`, the
+/// end of its retention, so lapsed subscriptions do not stay forever.
 ///
 /// * A push is its own item, so two webhooks landing on two instances both
 ///   survive; the sort key keeps them in arrival order.
@@ -32,17 +34,20 @@ public struct DynamoDBRelayStore: RelayStorage {
     let transport: any AWSJSONTransport
     let table: String
     let pendingTTL: TimeInterval
+    let entitlementRetention: TimeInterval
     let now: @Sendable () -> Date
 
     public init(
         transport: any AWSJSONTransport,
         table: String,
         pendingTTL: TimeInterval = 24 * 3600,
+        entitlementRetention: TimeInterval = Entitlement.retention,
         now: @escaping @Sendable () -> Date = { .now }
     ) {
         self.transport = transport
         self.table = table
         self.pendingTTL = pendingTTL
+        self.entitlementRetention = entitlementRetention
         self.now = now
     }
 
@@ -181,6 +186,10 @@ public struct DynamoDBRelayStore: RelayStorage {
         item["signedAt"] = ["N": Self.number(entitlement.signedAt)]
         if let expiresAt = entitlement.expiresAt { item["periodEndsAt"] = ["N": Self.number(expiresAt)] }
         if let revokedAt = entitlement.revokedAt { item["revokedAt"] = ["N": Self.number(revokedAt)] }
+        if let deletable = entitlement.deletableAfter(retention: entitlementRetention) {
+            // DynamoDB TTL wants whole epoch seconds; a renewal moves it on.
+            item["expiresAt"] = ["N": String(Int(deletable.timeIntervalSince1970.rounded(.up)))]
+        }
         do {
             // Written only when at least as new as what is stored: two
             // instances applying a renewal and a late, older notification in

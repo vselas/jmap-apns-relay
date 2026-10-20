@@ -87,10 +87,10 @@ struct DynamoDBLocalTests {
         #expect(try await store.registration(deviceId: device)?.apnsToken == "tok")
     }
 
-    /// The entitlement must not carry the table's TTL attribute, or DynamoDB
-    /// would delete it when the period ended — and a renewal would find
-    /// nothing to extend.
-    @Test func anEntitlementIsNotSubjectToTTL() async throws {
+    /// The entitlement's TTL is the end of its retention, never the end of its
+    /// period: DynamoDB must not delete it at lapse, or a late renewal would
+    /// find nothing to extend.
+    @Test func anEntitlementOutlivesItsPeriodByTheRetention() async throws {
         let store = try makeStore()
         let id = "sub-\(run)-ttl"
         try await store.upsertEntitlement(
@@ -101,8 +101,8 @@ struct DynamoDBLocalTests {
             body: ["TableName": store.table, "Key": DynamoDBRelayStore.entitlementKey(id), "ConsistentRead": true]
         )
         let item = try #require(response["Item"] as? [String: Any])
-        #expect(item["expiresAt"] == nil)
-        #expect(item["periodEndsAt"] != nil)
+        #expect(DynamoDBRelayStore.int(item["expiresAt"]) == 1 + Int(Entitlement.retention))
+        #expect(DynamoDBRelayStore.date(item["periodEndsAt"]) == Date(timeIntervalSince1970: 1))
     }
 
     @Test func pushesRoundTripAgainstRealDynamoDB() async throws {

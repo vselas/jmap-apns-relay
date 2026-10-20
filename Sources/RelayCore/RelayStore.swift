@@ -150,11 +150,19 @@ public actor RelayStore: RelayStorage {
     private var entitlements: [String: Entitlement] = [:]
     private let persistenceURL: URL?
     private let maxQueue = RelayLimits.maxPendingPerDevice
+    private let entitlementRetention: TimeInterval
+    private let now: @Sendable () -> Date
 
     private var persistenceError: String?
 
-    public init(persistenceURL: URL?) throws {
+    public init(
+        persistenceURL: URL?,
+        entitlementRetention: TimeInterval = Entitlement.retention,
+        now: @escaping @Sendable () -> Date = { .now }
+    ) throws {
         self.persistenceURL = persistenceURL
+        self.entitlementRetention = entitlementRetention
+        self.now = now
         guard let persistenceURL else { return }
         let parent = persistenceURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -167,7 +175,15 @@ public actor RelayStore: RelayStorage {
             }
             registrations = snapshot.registrations
             pending = snapshot.pending
-            entitlements = snapshot.entitlements ?? [:]
+            let stored = snapshot.entitlements ?? [:]
+            entitlements = Self.retained(stored, retention: entitlementRetention, at: now())
+            if entitlements.count < stored.count {
+                // Lapsed past retention while the relay was down: drop them
+                // from disk now, not at the next unrelated write.
+                var pruned = snapshot
+                pruned.entitlements = entitlements.isEmpty ? nil : entitlements
+                try JSONEncoder().encode(pruned).write(to: persistenceURL, options: .atomic)
+            }
         } else {
             let legacy = try decoder.decode(LegacySnapshot.self, from: data)
             registrations = legacy.registrations
@@ -275,7 +291,11 @@ public actor RelayStore: RelayStorage {
 
     public func isReady() -> Bool { persistenceError == nil }
 
-    public func entitlement(id: String) -> Entitlement? { entitlements[id] }
+    public func entitlement(id: String) -> Entitlement? {
+        guard let entitlement = entitlements[id], Self.isRetained(entitlement, retention: entitlementRetention, at: now())
+        else { return nil }
+        return entitlement
+    }
 
     @discardableResult
     public func upsertEntitlement(_ entitlement: Entitlement) throws -> Entitlement {
@@ -295,8 +315,20 @@ public actor RelayStore: RelayStorage {
         registrations.values.filter { $0.entitlementId == entitlementId }.map(\.deviceId).sorted()
     }
 
+    static func isRetained(_ entitlement: Entitlement, retention: TimeInterval, at now: Date) -> Bool {
+        entitlement.deletableAfter(retention: retention).map { $0 > now } ?? true
+    }
+
+    static func retained(
+        _ entitlements: [String: Entitlement], retention: TimeInterval, at now: Date
+    ) -> [String: Entitlement] {
+        entitlements.filter { isRetained($0.value, retention: retention, at: now) }
+    }
+
     private func persist() throws {
         guard let persistenceURL else { return }
+        // Every write also drops entitlements past their retention.
+        entitlements = Self.retained(entitlements, retention: entitlementRetention, at: now())
         let snapshot = Snapshot(
             version: Snapshot.currentVersion,
             registrations: registrations,

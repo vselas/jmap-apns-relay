@@ -255,6 +255,11 @@ A missing parameter stops the cold start rather than starting an open relay.
 so concurrent instances never overwrite each other's queue. Queued pushes carry
 an `expiresAt` TTL of one day — the queue exists for the client's verification
 poll, which comes within minutes — and a drain returns at most the newest 50.
+A paid relay also keeps one item per subscription (`pk = entitlement#<original
+transaction id>`). Its `expiresAt` TTL is 90 days after the period ends or Apple
+revokes it (`Entitlement.retention`), and every renewal moves it on, so no lapsed
+subscription is kept forever; a returning subscriber's next registration stores
+it again. The file store applies the same rule.
 
 **Cost control.** The webhook is unauthenticated by design, so the function has
 a reserved concurrency (`RESERVED_CONCURRENCY`, default 20) that caps what a

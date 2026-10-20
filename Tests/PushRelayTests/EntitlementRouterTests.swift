@@ -53,10 +53,11 @@ private actor CountingSender: PushSender {
 /// Runs every rule against both stores: they must agree.
 enum StoreKind: CaseIterable, CustomTestStringConvertible {
     case file, dynamo
-    func make() throws -> any RelayStorage {
+    /// `now` is the test's clock: the stores age entitlements out against it.
+    func make(now: @escaping @Sendable () -> Date) throws -> any RelayStorage {
         switch self {
-        case .file: try RelayStore(persistenceURL: nil)
-        case .dynamo: DynamoDBRelayStore(transport: FakeDynamoDB(), table: "relay")
+        case .file: try RelayStore(persistenceURL: nil, now: now)
+        case .dynamo: DynamoDBRelayStore(transport: FakeDynamoDB(), table: "relay", now: now)
         }
     }
     var testDescription: String { self == .file ? "file" : "dynamodb" }
@@ -103,7 +104,7 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
 
     @Test(arguments: StoreKind.allCases)
     func registrationNeedsAValidProofOnce(_ kind: StoreKind) async throws {
-        let store = try kind.make()
+        let store = try kind.make(now: { [clock] in clock.now })
         let app = makeApp(store: store, sender: CountingSender())
         try await app.test(.router) { client in
             let (missing, missingBody) = try await register(client, "d1")
@@ -128,7 +129,7 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
 
     @Test(arguments: StoreKind.allCases)
     func oneSubscriptionCoversALimitedNumberOfDevices(_ kind: StoreKind) async throws {
-        let app = makeApp(store: try kind.make(), sender: CountingSender(), maxDevices: 2)
+        let app = makeApp(store: try kind.make(now: { [clock] in clock.now }), sender: CountingSender(), maxDevices: 2)
         try await app.test(.router) { client in
             #expect(try await register(client, "d1", proof: "valid:sub1:3600").0 == .noContent)
             #expect(try await register(client, "d2", proof: "valid:sub1:3600").0 == .noContent)
@@ -144,7 +145,7 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
 
     @Test(arguments: StoreKind.allCases)
     func pushReachesAPNsOnlyWhilePaid(_ kind: StoreKind) async throws {
-        let store = try kind.make()
+        let store = try kind.make(now: { [clock] in clock.now })
         let sender = CountingSender()
         let app = makeApp(store: store, sender: sender)
         try await app.test(.router) { client in
@@ -168,7 +169,7 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
     /// verification code still reaches the app's poll.
     @Test(arguments: StoreKind.allCases)
     func theVerificationPollWorksForALapsedDevice(_ kind: StoreKind) async throws {
-        let store = try kind.make()
+        let store = try kind.make(now: { [clock] in clock.now })
         let sender = CountingSender()
         try await store.register(DeviceRegistration(deviceId: "d1", apnsToken: "tok"))
         let app = makeApp(store: store, sender: sender)
@@ -185,7 +186,7 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
 
     @Test(arguments: StoreKind.allCases)
     func serverNotificationsDriveTheEntitlement(_ kind: StoreKind) async throws {
-        let store = try kind.make()
+        let store = try kind.make(now: { [clock] in clock.now })
         let sender = CountingSender()
         let app = makeApp(store: store, sender: sender)
         try await app.test(.router) { client in
@@ -242,10 +243,10 @@ enum StoreKind: CaseIterable, CustomTestStringConvertible {
     @Test func entitlementsSurviveARestartOfTheFileStore() async throws {
         let url = FileManager.default.temporaryDirectory.appending(path: "\(UUID().uuidString)/relay.json")
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let store = try RelayStore(persistenceURL: url)
+        let store = try RelayStore(persistenceURL: url, now: { Self.now })
         try await store.upsertEntitlement(Entitlement(originalTransactionId: "sub1", productId: "pro", expiresAt: Self.now, signedAt: Self.now))
         try await store.register(DeviceRegistration(deviceId: "d1", entitlementId: "sub1"))
-        let reopened = try RelayStore(persistenceURL: url)
+        let reopened = try RelayStore(persistenceURL: url, now: { Self.now })
         let entitlement = try await reopened.entitlement(id: "sub1")
         let devices = try await reopened.devices(entitlementId: "sub1")
         #expect(entitlement?.expiresAt == Self.now)
